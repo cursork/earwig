@@ -232,10 +232,13 @@ func TestDuplicateSnapshotHash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Same files = same hash. Should fail due to UNIQUE constraint.
-	_, err = s.CreateSnapshot(nil, files, "second")
-	if err == nil {
-		t.Fatal("expected error for duplicate snapshot hash")
+	// Same files, but timestamp in hash makes each snapshot unique.
+	snap2, err := s.CreateSnapshot(nil, files, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap2.Hash == "" {
+		t.Fatal("expected non-empty hash for second snapshot")
 	}
 }
 

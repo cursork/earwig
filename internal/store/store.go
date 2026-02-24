@@ -61,18 +61,28 @@ func (s *Store) GetBlob(hash string) ([]byte, error) {
 }
 
 func (s *Store) CreateSnapshot(parentID *int64, files []SnapshotFile, message string) (*Snapshot, error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
 	// Compute snapshot hash from sorted file manifest
 	sorted := make([]SnapshotFile, len(files))
 	copy(sorted, files)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
 
+	now := time.Now().UTC()
+
 	var b strings.Builder
+	// Include parent and timestamp so every snapshot is unique,
+	// even if the same state is reached from the same parent twice.
+	b.WriteString("time:")
+	b.WriteString(now.Format(time.RFC3339Nano))
+	b.WriteByte('\n')
+	if parentID != nil {
+		var parentHash string
+		if err := s.db.QueryRow(`SELECT hash FROM snapshots WHERE id = ?`, *parentID).Scan(&parentHash); err != nil {
+			return nil, fmt.Errorf("getting parent hash: %w", err)
+		}
+		b.WriteString("parent:")
+		b.WriteString(parentHash)
+		b.WriteByte('\n')
+	}
 	for _, f := range sorted {
 		b.WriteString(f.Path)
 		b.WriteByte(':')
@@ -82,7 +92,12 @@ func (s *Store) CreateSnapshot(parentID *int64, files []SnapshotFile, message st
 	h := sha256.Sum256([]byte(b.String()))
 	hash := hex.EncodeToString(h[:])
 
-	now := time.Now().UTC()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
 	res, err := tx.Exec(
 		`INSERT INTO snapshots (hash, parent_id, created_at, message) VALUES (?, ?, ?, ?)`,
 		hash, parentID, now.Format(time.RFC3339), message,

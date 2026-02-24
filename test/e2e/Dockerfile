@@ -4,11 +4,14 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN go build -o /earwig .
+RUN go build -o /earwig-gen ./test/e2e/gen
 
 FROM alpine:3.21
 RUN apk add --no-cache bash
 COPY --from=build /earwig /usr/local/bin/earwig
-COPY test/e2e/dsl.sh  /test/dsl.sh
-COPY test/e2e/test.sh /test/test.sh
-RUN chmod +x /test/dsl.sh /test/test.sh
-CMD ["/test/test.sh"]
+COPY --from=build /earwig-gen /usr/local/bin/earwig-gen
+COPY test/e2e/dsl.sh     /test/dsl.sh
+COPY test/e2e/test.sh    /test/test.sh
+COPY test/e2e/run-all.sh /test/run-all.sh
+RUN chmod +x /test/*.sh
+CMD ["/test/run-all.sh"]
