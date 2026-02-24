@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS snapshot_files (
     mode        INTEGER NOT NULL,
     mod_time    TEXT NOT NULL,
     size        INTEGER NOT NULL,
+    type        TEXT NOT NULL DEFAULT 'file',
     PRIMARY KEY (snapshot_id, path)
 );
 
@@ -39,6 +40,27 @@ func (s *Store) migrate() error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')`)
-	return err
+
+	// Check schema version and apply migrations
+	var version string
+	err = s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema_version'`).Scan(&version)
+	if err != nil {
+		// First run — set version
+		_, err = s.db.Exec(`INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '2')`)
+		return err
+	}
+
+	if version == "1" {
+		// v1 -> v2: add type column to snapshot_files
+		_, err = s.db.Exec(`ALTER TABLE snapshot_files ADD COLUMN type TEXT NOT NULL DEFAULT 'file'`)
+		if err != nil {
+			return err
+		}
+		_, err = s.db.Exec(`UPDATE meta SET value = '2' WHERE key = 'schema_version'`)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

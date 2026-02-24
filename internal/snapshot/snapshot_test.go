@@ -405,3 +405,153 @@ func TestIncrementalSnapshotRejectsTraversalPaths(t *testing.T) {
 		t.Fatal("expected nil snapshot for traversal-only changed paths")
 	}
 }
+
+func TestRestoreRemovesSymlinkAtFilePath(t *testing.T) {
+	s, dir := setup(t)
+	writeFile(t, dir, "a.txt", "original")
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap, _ := c.TakeSnapshot(nil, "first")
+
+	// Create a canary file outside the root and replace a.txt with a symlink to it
+	canaryPath := filepath.Join(t.TempDir(), "canary")
+	os.WriteFile(canaryPath, []byte("do not touch"), 0644)
+
+	aPath := filepath.Join(dir, "a.txt")
+	os.Remove(aPath)
+	os.Symlink(canaryPath, aPath)
+
+	// Restore should remove the symlink and write the regular file
+	restorer := NewRestorer(s, dir, ig)
+	if err := restorer.Restore(snap.ID); err != nil {
+		t.Fatalf("Restore failed: %v", err)
+	}
+
+	// a.txt should be a regular file with the original content
+	info, err := os.Lstat(aPath)
+	if err != nil {
+		t.Fatalf("a.txt missing after restore: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("a.txt is still a symlink after restore")
+	}
+	data, _ := os.ReadFile(aPath)
+	if string(data) != "original" {
+		t.Fatalf("a.txt has wrong content: %q", data)
+	}
+
+	// Canary must be untouched
+	canary, _ := os.ReadFile(canaryPath)
+	if string(canary) != "do not touch" {
+		t.Fatalf("canary was modified: %q", canary)
+	}
+}
+
+func TestRestoreRemovesSymlinkInDirPath(t *testing.T) {
+	s, dir := setup(t)
+	writeFile(t, dir, "sub/a.txt", "original")
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap, _ := c.TakeSnapshot(nil, "first")
+
+	// Replace the "sub" directory with a symlink to an outside directory
+	outsideDir := t.TempDir()
+	os.WriteFile(filepath.Join(outsideDir, "a.txt"), []byte("do not touch"), 0644)
+
+	os.RemoveAll(filepath.Join(dir, "sub"))
+	os.Symlink(outsideDir, filepath.Join(dir, "sub"))
+
+	// Restore should remove the symlink, recreate the dir, and write the file
+	restorer := NewRestorer(s, dir, ig)
+	if err := restorer.Restore(snap.ID); err != nil {
+		t.Fatalf("Restore failed: %v", err)
+	}
+
+	// sub should be a real directory, not a symlink
+	info, err := os.Lstat(filepath.Join(dir, "sub"))
+	if err != nil {
+		t.Fatalf("sub missing after restore: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("sub is still a symlink after restore")
+	}
+
+	// sub/a.txt should have the snapshot content
+	data, _ := os.ReadFile(filepath.Join(dir, "sub", "a.txt"))
+	if string(data) != "original" {
+		t.Fatalf("sub/a.txt has wrong content: %q", data)
+	}
+
+	// Outside directory's file must be untouched
+	outside, _ := os.ReadFile(filepath.Join(outsideDir, "a.txt"))
+	if string(outside) != "do not touch" {
+		t.Fatalf("outside file was modified: %q", outside)
+	}
+}
+
+func TestSymlinkRoundTrip(t *testing.T) {
+	s, dir := setup(t)
+
+	// Create a regular file and a symlink
+	writeFile(t, dir, "real.txt", "real content")
+	target := filepath.Join(t.TempDir(), "external")
+	os.WriteFile(target, []byte("external"), 0644)
+	os.Symlink(target, filepath.Join(dir, "link.txt"))
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+
+	// Snapshot should capture both the file and the symlink
+	snap, err := c.TakeSnapshot(nil, "with-symlink")
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	files, _ := s.GetSnapshotFiles(snap.ID)
+	if len(files) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(files))
+	}
+
+	fileMap := map[string]store.SnapshotFile{}
+	for _, f := range files {
+		fileMap[f.Path] = f
+	}
+
+	if fileMap["real.txt"].Type != "file" {
+		t.Fatalf("real.txt should be type 'file', got %q", fileMap["real.txt"].Type)
+	}
+	if fileMap["link.txt"].Type != "symlink" {
+		t.Fatalf("link.txt should be type 'symlink', got %q", fileMap["link.txt"].Type)
+	}
+
+	// Delete everything and restore
+	os.RemoveAll(filepath.Join(dir, "real.txt"))
+	os.Remove(filepath.Join(dir, "link.txt"))
+
+	restorer := NewRestorer(s, dir, ig)
+	if err := restorer.Restore(snap.ID); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	// real.txt should be a regular file
+	data, _ := os.ReadFile(filepath.Join(dir, "real.txt"))
+	if string(data) != "real content" {
+		t.Fatalf("real.txt content: %q", data)
+	}
+
+	// link.txt should be a symlink pointing to the original target
+	linkPath := filepath.Join(dir, "link.txt")
+	info, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatalf("link.txt missing: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("link.txt should be a symlink after restore")
+	}
+	got, _ := os.Readlink(linkPath)
+	if got != target {
+		t.Fatalf("link.txt target: got %q, want %q", got, target)
+	}
+}

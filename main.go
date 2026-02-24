@@ -282,7 +282,7 @@ func cmdFiles(args []string) error {
 	}
 
 	for _, f := range files {
-		fmt.Printf("%s\t%d\t%s\n", f.Path, f.Size, f.BlobHash)
+		fmt.Printf("%s\t%d\t%s\t%s\n", f.Path, f.Size, f.BlobHash, f.Type)
 	}
 	return nil
 }

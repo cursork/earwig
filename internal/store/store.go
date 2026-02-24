@@ -112,7 +112,7 @@ func (s *Store) CreateSnapshot(parentID *int64, files []SnapshotFile, message st
 	}
 
 	stmt, err := tx.Prepare(
-		`INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, mod_time, size) VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, mod_time, size, type) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return nil, err
@@ -120,7 +120,11 @@ func (s *Store) CreateSnapshot(parentID *int64, files []SnapshotFile, message st
 	defer stmt.Close()
 
 	for _, f := range files {
-		_, err := stmt.Exec(id, f.Path, f.BlobHash, f.Mode, f.ModTime.Format(time.RFC3339), f.Size)
+		fileType := f.Type
+		if fileType == "" {
+			fileType = "file"
+		}
+		_, err := stmt.Exec(id, f.Path, f.BlobHash, f.Mode, f.ModTime.Format(time.RFC3339), f.Size, fileType)
 		if err != nil {
 			return nil, fmt.Errorf("inserting snapshot file %s: %w", f.Path, err)
 		}
@@ -175,7 +179,7 @@ func (s *Store) GetSnapshot(hashPrefix string) (*Snapshot, error) {
 
 func (s *Store) GetSnapshotFiles(snapshotID int64) ([]SnapshotFile, error) {
 	rows, err := s.db.Query(
-		`SELECT path, blob_hash, mode, mod_time, size FROM snapshot_files WHERE snapshot_id = ? ORDER BY path`,
+		`SELECT path, blob_hash, mode, mod_time, size, type FROM snapshot_files WHERE snapshot_id = ? ORDER BY path`,
 		snapshotID,
 	)
 	if err != nil {
@@ -188,7 +192,7 @@ func (s *Store) GetSnapshotFiles(snapshotID int64) ([]SnapshotFile, error) {
 		var f SnapshotFile
 		var modTime string
 		f.SnapshotID = snapshotID
-		if err := rows.Scan(&f.Path, &f.BlobHash, &f.Mode, &modTime, &f.Size); err != nil {
+		if err := rows.Scan(&f.Path, &f.BlobHash, &f.Mode, &modTime, &f.Size, &f.Type); err != nil {
 			return nil, err
 		}
 		f.ModTime, _ = time.Parse(time.RFC3339, modTime)

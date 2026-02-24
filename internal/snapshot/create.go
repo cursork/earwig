@@ -48,6 +48,31 @@ func (c *Creator) TakeSnapshot(parentID *int64, message string) (*store.Snapshot
 			return nil
 		}
 
+		if d.Type()&os.ModeSymlink != 0 {
+			// Store symlink: blob content = link target
+			target, err := os.Readlink(path)
+			if err != nil {
+				return nil
+			}
+			blobHash, err := c.store.PutBlob([]byte(target))
+			if err != nil {
+				return err
+			}
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			files = append(files, store.SnapshotFile{
+				Path:     relPath,
+				BlobHash: blobHash,
+				Mode:     uint32(info.Mode().Perm()),
+				ModTime:  info.ModTime(),
+				Size:     int64(len(target)),
+				Type:     "symlink",
+			})
+			return nil
+		}
+
 		if !d.Type().IsRegular() {
 			return nil
 		}
@@ -73,6 +98,7 @@ func (c *Creator) TakeSnapshot(parentID *int64, message string) (*store.Snapshot
 			Mode:     uint32(info.Mode().Perm()),
 			ModTime:  info.ModTime(),
 			Size:     info.Size(),
+			Type:     "file",
 		})
 
 		return nil
@@ -115,7 +141,7 @@ func (c *Creator) TakeIncrementalSnapshot(parentID int64, changedPaths map[strin
 		if err != nil {
 			continue // skip paths that escape root
 		}
-		info, statErr := os.Stat(absPath)
+		info, statErr := os.Lstat(absPath)
 
 		if statErr != nil {
 			// Path doesn't exist — deleted file or directory
@@ -144,6 +170,14 @@ func (c *Creator) TakeIncrementalSnapshot(parentID int64, changedPaths map[strin
 					}
 					return nil
 				}
+				if d.Type()&os.ModeSymlink != 0 {
+					sf, err := c.readSymlink(p, relPath)
+					if err != nil {
+						return nil
+					}
+					fileMap[relPath] = sf
+					return nil
+				}
 				if !d.Type().IsRegular() {
 					return nil
 				}
@@ -154,6 +188,15 @@ func (c *Creator) TakeIncrementalSnapshot(parentID int64, changedPaths map[strin
 				fileMap[relPath] = sf
 				return nil
 			})
+			continue
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			sf, err := c.readSymlink(absPath, path)
+			if err != nil {
+				continue
+			}
+			fileMap[path] = sf
 			continue
 		}
 
@@ -181,7 +224,7 @@ func (c *Creator) TakeIncrementalSnapshot(parentID int64, changedPaths map[strin
 	return c.store.CreateSnapshot(&parentID, files, message)
 }
 
-// readFile reads a file, stores its blob, and returns a SnapshotFile.
+// readFile reads a regular file, stores its blob, and returns a SnapshotFile.
 func (c *Creator) readFile(absPath, relPath string) (store.SnapshotFile, error) {
 	data, err := os.ReadFile(absPath)
 	if err != nil {
@@ -204,6 +247,34 @@ func (c *Creator) readFile(absPath, relPath string) (store.SnapshotFile, error) 
 		Mode:     uint32(info.Mode().Perm()),
 		ModTime:  info.ModTime(),
 		Size:     info.Size(),
+		Type:     "file",
+	}, nil
+}
+
+// readSymlink reads a symlink target, stores it as a blob, and returns a SnapshotFile.
+func (c *Creator) readSymlink(absPath, relPath string) (store.SnapshotFile, error) {
+	target, err := os.Readlink(absPath)
+	if err != nil {
+		return store.SnapshotFile{}, err
+	}
+
+	blobHash, err := c.store.PutBlob([]byte(target))
+	if err != nil {
+		return store.SnapshotFile{}, err
+	}
+
+	info, err := os.Lstat(absPath)
+	if err != nil {
+		return store.SnapshotFile{}, err
+	}
+
+	return store.SnapshotFile{
+		Path:     relPath,
+		BlobHash: blobHash,
+		Mode:     uint32(info.Mode().Perm()),
+		ModTime:  info.ModTime(),
+		Size:     int64(len(target)),
+		Type:     "symlink",
 	}, nil
 }
 

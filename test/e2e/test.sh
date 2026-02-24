@@ -369,6 +369,55 @@ fi
 rm -f /tmp/earwig-canary
 
 # =========================================================
+# TEST 12: Symlink protection during restore
+# =========================================================
+blue "=== TEST 12: Symlink protection ==="
+
+init_project /tmp/earwig-test-12
+
+write_file "target.txt" "original content"
+write_file "sub/deep.txt" "deep content"
+snapshot                                        # snapshot #1
+
+# Create a canary outside the project
+echo "do not touch" > /tmp/earwig-symlink-canary
+
+# Replace target.txt with a symlink to the canary
+rm -f target.txt
+ln -s /tmp/earwig-symlink-canary target.txt
+
+# Replace sub/ directory with a symlink to /tmp
+rm -rf sub
+ln -s /tmp sub
+
+# Restore should replace the symlinks with real files
+restore 1
+
+# target.txt should be a regular file with original content
+if [ -L target.txt ]; then
+    fail "target.txt should not be a symlink after restore" "still a symlink"
+else
+    expect_file "target.txt" "original content"
+fi
+
+# sub should be a real directory
+if [ -L sub ]; then
+    fail "sub/ should not be a symlink after restore" "still a symlink"
+else
+    expect_file "sub/deep.txt" "deep content"
+fi
+
+# Canary must be untouched
+canary=$(cat /tmp/earwig-symlink-canary)
+if [ "$canary" = "do not touch" ]; then
+    pass "symlink canary not modified"
+else
+    fail "symlink canary not modified" "content changed to: $canary"
+fi
+
+rm -f /tmp/earwig-symlink-canary
+
+# =========================================================
 # DONE
 # =========================================================
 summary

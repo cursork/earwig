@@ -23,6 +23,7 @@ type SnapshotFile struct {
 	Mode       uint32
 	ModTime    time.Time
 	Size       int64
+	Type       string // "file" or "symlink"
 }
 
 type ChangeType int

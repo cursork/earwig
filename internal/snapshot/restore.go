@@ -51,7 +51,7 @@ func (r *Restorer) Restore(snapshotID int64) error {
 			}
 			return nil
 		}
-		if d.Type().IsRegular() {
+		if d.Type().IsRegular() || d.Type()&os.ModeSymlink != 0 {
 			existingPaths = append(existingPaths, relPath)
 		}
 		return nil
@@ -81,11 +81,26 @@ func (r *Restorer) Restore(snapshotID int64) error {
 			return fmt.Errorf("unsafe path in snapshot: %w", err)
 		}
 
+		// Remove anything at this path that doesn't match the target type.
+		// Symlinks are always removed first to prevent following them.
+		if info, err := os.Lstat(absPath); err == nil {
+			isLink := info.Mode()&os.ModeSymlink != 0
+			if isLink {
+				os.Remove(absPath)
+			}
+		}
+
 		// If file exists on disk, check if it already matches the target
 		if existingSet[f.Path] {
 			if h, err := hashFile(absPath); err == nil && h == f.BlobHash {
 				continue // Already matches, skip
 			}
+		}
+
+		// Check parent directories for symlinks — a symlink where
+		// a directory should be would cause MkdirAll to follow it.
+		if err := removeSymlinksInPath(r.rootDir, filepath.Dir(absPath)); err != nil {
+			return err
 		}
 
 		os.MkdirAll(filepath.Dir(absPath), 0755)
@@ -95,8 +110,15 @@ func (r *Restorer) Restore(snapshotID int64) error {
 			return err
 		}
 
-		if err := os.WriteFile(absPath, data, os.FileMode(f.Mode)); err != nil {
-			return err
+		if f.Type == "symlink" {
+			// Blob content is the symlink target path
+			if err := os.Symlink(string(data), absPath); err != nil {
+				return err
+			}
+		} else {
+			if err := os.WriteFile(absPath, data, os.FileMode(f.Mode)); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -130,6 +152,47 @@ func (r *Restorer) Restore(snapshotID int64) error {
 	}
 
 	return nil
+}
+
+// removeSymlinksInPath walks from rootDir down to targetDir and removes any
+// symlinks found along the way. This prevents MkdirAll from following a symlink
+// into a location outside the root.
+func removeSymlinksInPath(rootDir, targetDir string) error {
+	rel, err := filepath.Rel(rootDir, targetDir)
+	if err != nil {
+		return nil
+	}
+	parts := filepath.SplitList(rel)
+	if len(parts) == 0 {
+		// SplitList is for PATH-style lists; use manual split
+		parts = nil
+		for _, p := range splitPath(rel) {
+			parts = append(parts, p)
+		}
+	}
+	current := rootDir
+	for _, part := range splitPath(rel) {
+		current = filepath.Join(current, part)
+		if info, err := os.Lstat(current); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			if err := os.Remove(current); err != nil {
+				return fmt.Errorf("removing symlink at %s: %w", current, err)
+			}
+		}
+	}
+	return nil
+}
+
+// splitPath splits a filepath into its components.
+func splitPath(path string) []string {
+	var parts []string
+	for path != "" && path != "." {
+		dir, file := filepath.Split(path)
+		if file != "" {
+			parts = append([]string{file}, parts...)
+		}
+		path = filepath.Clean(dir)
+	}
+	return parts
 }
 
 // hashFile computes the SHA-256 of a file by streaming, without loading it all into memory.
