@@ -101,20 +101,22 @@ func TestSnapshotIgnoresCustomPatterns(t *testing.T) {
 	s, dir := setup(t)
 	writeFile(t, dir, "a.txt", "tracked")
 	writeFile(t, dir, "debug.log", "should be ignored")
-	writeFile(t, dir, ".earwigignore", "*.log\n")
+	earwigDir := filepath.Join(dir, ".earwig")
+	os.MkdirAll(earwigDir, 0755)
+	writeFile(t, dir, filepath.Join(".earwig", "ignore"), "*.log\n")
 
-	ig, _ := ignore.New([]string{filepath.Join(dir, ".earwigignore")})
+	ig, _ := ignore.New([]string{filepath.Join(earwigDir, "ignore")})
 	c := NewCreator(s, dir, ig)
 
 	snap, _ := c.TakeSnapshot(nil, "test")
 	files, _ := s.GetSnapshotFiles(snap.ID)
 
-	if len(files) != 2 { // a.txt + .earwigignore
+	if len(files) != 1 { // a.txt only (.earwig/ is always ignored)
 		names := []string{}
 		for _, f := range files {
 			names = append(names, f.Path)
 		}
-		t.Fatalf("expected 2 tracked files, got %d: %v", len(files), names)
+		t.Fatalf("expected 1 tracked file, got %d: %v", len(files), names)
 	}
 }
 

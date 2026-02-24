@@ -96,7 +96,7 @@ func openStore() (*store.Store, string, error) {
 
 func loadIgnore(root string) (*ignore.Matcher, error) {
 	var files []string
-	for _, name := range []string{".earwigignore", ".gitignore"} {
+	for _, name := range []string{filepath.Join(".earwig", "ignore"), ".gitignore"} {
 		p := filepath.Join(root, name)
 		if _, err := os.Stat(p); err == nil {
 			files = append(files, p)
@@ -467,6 +467,21 @@ func cmdRestore(args []string) error {
 		return fmt.Errorf("acquiring lock: %w", err)
 	}
 	defer releaseLock(root)
+
+	// Auto-snapshot current state before restore so the user can undo
+	parentID, err := readHead(root, s)
+	if err != nil {
+		return err
+	}
+	c := snapshot.NewCreator(s, root, ig)
+	preSnap, err := c.TakeSnapshot(parentID, "pre-restore")
+	if err != nil {
+		return fmt.Errorf("pre-restore snapshot: %w", err)
+	}
+	if preSnap != nil {
+		writeHead(root, preSnap.ID)
+		fmt.Printf("Saved current state as %s\n", preSnap.Hash[:12])
+	}
 
 	restorer := snapshot.NewRestorer(s, root, ig)
 	if err := restorer.Restore(snap.ID); err != nil {
