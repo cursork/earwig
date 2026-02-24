@@ -14,7 +14,7 @@ type Watcher struct {
 	fsw     *fsnotify.Watcher
 	root    string
 	ignore  *ignore.Matcher
-	OnEvent func()
+	OnEvent func(relPath string)
 }
 
 func New(root string, ig *ignore.Matcher) (*Watcher, error) {
@@ -81,7 +81,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 			}
 
 			if w.OnEvent != nil {
-				w.OnEvent()
+				w.OnEvent(relPath)
 			}
 
 		case err, ok := <-w.fsw.Errors:

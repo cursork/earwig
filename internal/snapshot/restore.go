@@ -1,6 +1,9 @@
 package snapshot
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -61,9 +64,22 @@ func (r *Restorer) Restore(snapshotID int64) error {
 		}
 	}
 
-	// Write files from target snapshot
+	// Build set of existing files for quick lookup
+	existingSet := make(map[string]bool, len(existingPaths))
+	for _, p := range existingPaths {
+		existingSet[p] = true
+	}
+
+	// Write files from target snapshot, skipping files that already match
 	for _, f := range targetFiles {
 		absPath := filepath.Join(r.rootDir, filepath.FromSlash(f.Path))
+
+		// If file exists on disk, check if it already matches the target
+		if existingSet[f.Path] {
+			if h, err := hashFile(absPath); err == nil && h == f.BlobHash {
+				continue // Already matches, skip
+			}
+		}
 
 		os.MkdirAll(filepath.Dir(absPath), 0755)
 
@@ -107,4 +123,19 @@ func (r *Restorer) Restore(snapshotID int64) error {
 	}
 
 	return nil
+}
+
+// hashFile computes the SHA-256 of a file by streaming, without loading it all into memory.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

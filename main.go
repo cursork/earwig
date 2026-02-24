@@ -8,7 +8,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -282,6 +284,50 @@ func writeHead(root string, id int64) {
 	os.WriteFile(headPath, []byte(fmt.Sprintf("%d", id)), 0644)
 }
 
+// Lock file: prevents watcher from snapshotting during restore
+
+func lockPath(root string) string {
+	return filepath.Join(root, ".earwig", "LOCK")
+}
+
+func acquireLock(root string) error {
+	content := fmt.Sprintf("%d %d", os.Getpid(), time.Now().Unix())
+	return os.WriteFile(lockPath(root), []byte(content), 0644)
+}
+
+func releaseLock(root string) {
+	os.Remove(lockPath(root))
+}
+
+// isLocked returns true if a live restore process holds the lock.
+// Removes stale locks from dead processes.
+func isLocked(root string) bool {
+	data, err := os.ReadFile(lockPath(root))
+	if err != nil {
+		return false
+	}
+	parts := strings.Fields(string(data))
+	if len(parts) < 1 {
+		return false
+	}
+	pid, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return false
+	}
+	// Check if process is still alive
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		os.Remove(lockPath(root))
+		return false
+	}
+	// On Unix, FindProcess always succeeds. Signal 0 checks if process exists.
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		os.Remove(lockPath(root))
+		return false
+	}
+	return true
+}
+
 func cmdWatch(args []string) error {
 	s, root, err := openStore()
 	if err != nil {
@@ -294,7 +340,17 @@ func cmdWatch(args []string) error {
 		return err
 	}
 
+	var (
+		mu           sync.Mutex
+		changedPaths = make(map[string]bool)
+		snapCount    int
+	)
+
 	takeSnap := func() {
+		if isLocked(root) {
+			return
+		}
+
 		parentID, err := readHead(root, s)
 		if err != nil {
 			log.Printf("error reading HEAD: %v", err)
@@ -302,7 +358,22 @@ func cmdWatch(args []string) error {
 		}
 
 		c := snapshot.NewCreator(s, root, ig)
-		snap, err := c.TakeSnapshot(parentID, "auto")
+
+		var snap *store.Snapshot
+
+		// Swap out changed paths
+		mu.Lock()
+		paths := changedPaths
+		changedPaths = make(map[string]bool)
+		mu.Unlock()
+
+		// Every 10th snapshot or if no parent, do a full walk for consistency
+		snapCount++
+		if parentID == nil || snapCount%10 == 0 || len(paths) == 0 {
+			snap, err = c.TakeSnapshot(parentID, "auto")
+		} else {
+			snap, err = c.TakeIncrementalSnapshot(*parentID, paths, "auto")
+		}
 		if err != nil {
 			log.Printf("error taking snapshot: %v", err)
 			return
@@ -315,7 +386,7 @@ func cmdWatch(args []string) error {
 		fmt.Printf("[%s] Snapshot %s\n", snap.CreatedAt.Format("15:04:05"), snap.Hash[:12])
 	}
 
-	// Initial snapshot
+	// Initial snapshot (always full walk)
 	takeSnap()
 
 	debouncer := watcher.NewDebouncer(1 * time.Minute)
@@ -326,7 +397,10 @@ func cmdWatch(args []string) error {
 		return err
 	}
 
-	w.OnEvent = func() {
+	w.OnEvent = func(relPath string) {
+		mu.Lock()
+		changedPaths[relPath] = true
+		mu.Unlock()
 		debouncer.Trigger(takeSnap)
 	}
 
@@ -357,6 +431,11 @@ func cmdRestore(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	if err := acquireLock(root); err != nil {
+		return fmt.Errorf("acquiring lock: %w", err)
+	}
+	defer releaseLock(root)
 
 	restorer := snapshot.NewRestorer(s, root, ig)
 	if err := restorer.Restore(snap.ID); err != nil {
