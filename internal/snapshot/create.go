@@ -36,6 +36,11 @@ func (c *Creator) TakeSnapshot(parentID *int64, message string) (*store.Snapshot
 			return nil
 		}
 
+		// Defense in depth: reject paths that escape root
+		if strings.Contains(relPath, "..") {
+			return nil
+		}
+
 		if c.ignore.Match(relPath) {
 			if d.IsDir() {
 				return filepath.SkipDir
@@ -106,7 +111,10 @@ func (c *Creator) TakeIncrementalSnapshot(parentID int64, changedPaths map[strin
 	}
 
 	for path := range changedPaths {
-		absPath := filepath.Join(c.rootDir, filepath.FromSlash(path))
+		absPath, err := safePath(c.rootDir, path)
+		if err != nil {
+			continue // skip paths that escape root
+		}
 		info, statErr := os.Stat(absPath)
 
 		if statErr != nil {

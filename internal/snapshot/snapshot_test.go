@@ -317,3 +317,91 @@ func TestRestoreSkipsUnchangedFiles(t *testing.T) {
 		t.Fatal("b.txt was rewritten even though content matches")
 	}
 }
+
+func TestSafePath(t *testing.T) {
+	root := "/tmp/earwig-test-root"
+
+	tests := []struct {
+		name    string
+		relPath string
+		wantErr bool
+	}{
+		{"normal file", "a.txt", false},
+		{"nested file", "src/app.go", false},
+		{"dotdot escape", "../etc/passwd", true},
+		{"nested dotdot escape", "foo/../../etc/passwd", true},
+		{"absolute path", "/etc/passwd", true},
+		{"empty path", "", true},
+		{"just dot", ".", true},
+		{"dotdot only", "..", true},
+		{"deep dotdot", "a/b/c/../../../..", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := safePath(root, tt.relPath)
+			if tt.wantErr && err == nil {
+				t.Errorf("safePath(%q, %q) = nil error, want error", root, tt.relPath)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("safePath(%q, %q) = %v, want nil", root, tt.relPath, err)
+			}
+		})
+	}
+}
+
+func TestRestoreRejectsTraversalPaths(t *testing.T) {
+	s, dir := setup(t)
+	writeFile(t, dir, "a.txt", "legit")
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap, _ := c.TakeSnapshot(nil, "first")
+
+	// Manually insert a malicious snapshot with a ".." path
+	blobHash, _ := s.PutBlob([]byte("malicious content"))
+	malSnap, _ := s.CreateSnapshot(&snap.ID, []store.SnapshotFile{
+		{Path: "a.txt", BlobHash: blobHash, Mode: 0644, Size: 17},
+		{Path: "../escape.txt", BlobHash: blobHash, Mode: 0644, Size: 17},
+	}, "malicious")
+
+	// Create a canary file outside the root
+	canaryPath := filepath.Join(filepath.Dir(dir), "escape.txt")
+	os.WriteFile(canaryPath, []byte("canary"), 0644)
+	defer os.Remove(canaryPath)
+
+	// Restore should fail due to the traversal path
+	restorer := NewRestorer(s, dir, ig)
+	err := restorer.Restore(malSnap.ID)
+	if err == nil {
+		t.Fatal("expected error restoring snapshot with path traversal, got nil")
+	}
+
+	// Canary must be untouched
+	data, _ := os.ReadFile(canaryPath)
+	if string(data) != "canary" {
+		t.Fatal("canary file was modified by restore with traversal path")
+	}
+}
+
+func TestIncrementalSnapshotRejectsTraversalPaths(t *testing.T) {
+	s, dir := setup(t)
+	writeFile(t, dir, "a.txt", "hello")
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap, _ := c.TakeSnapshot(nil, "first")
+
+	// Try an incremental snapshot with a malicious changedPaths entry
+	// safePath should reject it silently (skip, not crash)
+	snap2, err := c.TakeIncrementalSnapshot(snap.ID, map[string]bool{
+		"../etc/passwd": true,
+	}, "malicious")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// No actual changes happened, so should be nil
+	if snap2 != nil {
+		t.Fatal("expected nil snapshot for traversal-only changed paths")
+	}
+}

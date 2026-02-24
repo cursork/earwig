@@ -3,6 +3,7 @@ package snapshot
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -59,7 +60,10 @@ func (r *Restorer) Restore(snapshotID int64) error {
 	// Delete files not in target snapshot
 	for _, path := range existingPaths {
 		if _, inTarget := targetMap[path]; !inTarget {
-			absPath := filepath.Join(r.rootDir, filepath.FromSlash(path))
+			absPath, err := safePath(r.rootDir, path)
+			if err != nil {
+				continue // skip paths that escape root
+			}
 			os.Remove(absPath)
 		}
 	}
@@ -72,7 +76,10 @@ func (r *Restorer) Restore(snapshotID int64) error {
 
 	// Write files from target snapshot, skipping files that already match
 	for _, f := range targetFiles {
-		absPath := filepath.Join(r.rootDir, filepath.FromSlash(f.Path))
+		absPath, err := safePath(r.rootDir, f.Path)
+		if err != nil {
+			return fmt.Errorf("unsafe path in snapshot: %w", err)
+		}
 
 		// If file exists on disk, check if it already matches the target
 		if existingSet[f.Path] {

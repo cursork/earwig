@@ -326,6 +326,49 @@ expect_file "empty.txt" ""
 expect_file "full.txt"  "content"
 
 # =========================================================
+# TEST 11: Path traversal protection
+# =========================================================
+blue "=== TEST 11: Path traversal protection ==="
+
+init_project /tmp/earwig-test-11
+
+# Create a canary file outside the project
+echo "canary" > /tmp/earwig-canary
+
+# Create a legit snapshot first
+write_file "legit.txt" "legit"
+snapshot                                        # snapshot #1
+
+# Manually inject a malicious snapshot_files row with a ".." path.
+# First, store a blob for the malicious content.
+db=".earwig/earwig.db"
+snap_id=$(sqlite3 "$db" "SELECT id FROM snapshots ORDER BY id DESC LIMIT 1")
+blob_hash=$(sqlite3 "$db" "SELECT hash FROM blobs LIMIT 1")
+
+# Insert a new snapshot with a traversal path
+sqlite3 "$db" "INSERT INTO snapshots (hash, parent_id, created_at, message) VALUES ('deadbeef', $snap_id, datetime('now'), 'malicious')"
+mal_id=$(sqlite3 "$db" "SELECT id FROM snapshots WHERE hash='deadbeef'")
+sqlite3 "$db" "INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, mod_time, size) VALUES ($mal_id, '../earwig-canary', '$blob_hash', 420, datetime('now'), 5)"
+sqlite3 "$db" "INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, mod_time, size) VALUES ($mal_id, 'legit.txt', '$blob_hash', 420, datetime('now'), 5)"
+
+# Attempt restore — should fail
+if earwig restore deadbeef 2>/dev/null; then
+    fail "restore with traversal path should fail" "restore succeeded"
+else
+    pass "restore with traversal path rejected"
+fi
+
+# Canary must be untouched
+canary_content=$(cat /tmp/earwig-canary)
+if [ "$canary_content" = "canary" ]; then
+    pass "canary file not modified"
+else
+    fail "canary file not modified" "content changed to: $canary_content"
+fi
+
+rm -f /tmp/earwig-canary
+
+# =========================================================
 # DONE
 # =========================================================
 summary

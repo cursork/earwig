@@ -7,7 +7,7 @@ RUN go build -o /earwig .
 RUN go build -o /earwig-gen ./test/e2e/gen
 
 FROM alpine:3.21
-RUN apk add --no-cache bash
+RUN apk add --no-cache bash sqlite
 COPY --from=build /earwig /usr/local/bin/earwig
 COPY --from=build /earwig-gen /usr/local/bin/earwig-gen
 COPY test/e2e/dsl.sh     /test/dsl.sh

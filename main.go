@@ -27,6 +27,7 @@ var commands = map[string]func([]string) error{
 	"show":     cmdShow,
 	"watch":    cmdWatch,
 	"restore":  cmdRestore,
+	"_files":   cmdFiles,
 }
 
 func main() {
@@ -56,6 +57,9 @@ func usage() {
 	}
 	sort.Strings(names)
 	for _, name := range names {
+		if strings.HasPrefix(name, "_") {
+			continue
+		}
 		fmt.Fprintf(os.Stderr, "  %s\n", name)
 	}
 }
@@ -252,6 +256,33 @@ func cmdShow(args []string) error {
 		case store.ChangeDeleted:
 			fmt.Printf("  D %s\n", c.Path)
 		}
+	}
+	return nil
+}
+
+func cmdFiles(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: earwig _files <hash>")
+	}
+
+	s, _, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	snap, err := s.GetSnapshot(args[0])
+	if err != nil {
+		return err
+	}
+
+	files, err := s.GetSnapshotFiles(snap.ID)
+	if err != nil {
+		return err
+	}
+
+	for _, f := range files {
+		fmt.Printf("%s\t%d\t%s\n", f.Path, f.Size, f.BlobHash)
 	}
 	return nil
 }
