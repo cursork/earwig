@@ -211,7 +211,7 @@ func (r *Restorer) Restore(snapshotID int64) error {
 func removeSymlinksInPath(rootDir, targetDir string) error {
 	rel, err := filepath.Rel(rootDir, targetDir)
 	if err != nil {
-		return nil
+		return fmt.Errorf("computing relative path from %s to %s: %w", rootDir, targetDir, err)
 	}
 	current := rootDir
 	for _, part := range splitPath(rel) {

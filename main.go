@@ -526,11 +526,11 @@ func cmdRestore(args []string) error {
 
 	// Write RESTORING marker so a crash midway can be detected on next run.
 	restoreMarker := filepath.Join(root, ".earwig", "RESTORING")
-	preHash := ""
 	if preSnap != nil {
-		preHash = shortHash(preSnap.Hash)
+		if err := os.WriteFile(restoreMarker, []byte(shortHash(preSnap.Hash)), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not write crash recovery marker: %v\n", err)
+		}
 	}
-	os.WriteFile(restoreMarker, []byte(preHash), 0644)
 
 	restorer := snapshot.NewRestorer(s, root, ig)
 	if err := restorer.Restore(snap.ID); err != nil {

@@ -12,6 +12,9 @@ func safePath(rootDir, relPath string) (string, error) {
 	if relPath == "" {
 		return "", fmt.Errorf("empty path")
 	}
+	if strings.ContainsRune(relPath, 0) {
+		return "", fmt.Errorf("path contains NUL byte")
+	}
 	if filepath.IsAbs(relPath) {
 		return "", fmt.Errorf("path is absolute: %s", relPath)
 	}

@@ -195,6 +195,16 @@ func (s *Store) CreateSnapshot(parentID *int64, files []SnapshotFile, message st
 	}
 	defer stmt.Close()
 
+	// Validate path consistency: no path should be a prefix of another
+	// (e.g. "foo" and "foo/bar.txt" can't coexist — "foo" can't be both
+	// a file and a directory).
+	for i := 1; i < len(sorted); i++ {
+		prev := sorted[i-1].Path + "/"
+		if strings.HasPrefix(sorted[i].Path, prev) {
+			return nil, fmt.Errorf("path conflict: %q and %q", sorted[i-1].Path, sorted[i].Path)
+		}
+	}
+
 	for _, f := range files {
 		fileType := f.Type
 		if fileType == "" {
