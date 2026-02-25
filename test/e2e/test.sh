@@ -1076,6 +1076,115 @@ else
 fi
 
 # =========================================================
+# TEST 30: .earwig/ directory permissions (S2)
+# =========================================================
+blue "=== TEST 30: .earwig/ directory permissions ==="
+
+init_project /tmp/earwig-test-30
+
+dir_mode=$(stat -c '%a' .earwig 2>/dev/null || stat -f '%Lp' .earwig 2>/dev/null)
+if [ "$dir_mode" = "700" ]; then
+    pass ".earwig/ created with mode 700"
+else
+    fail ".earwig/ created with mode 700" "got $dir_mode"
+fi
+
+# =========================================================
+# TEST 31: RESTORING marker not written when no changes (S4)
+# =========================================================
+blue "=== TEST 31: RESTORING marker skip on no-change ==="
+
+init_project /tmp/earwig-test-31
+
+write_file "a.txt" "content"
+snapshot                                        # snapshot #1
+
+# Restore to the same state — pre-restore snapshot should be nil (no changes)
+restore 1
+
+# The RESTORING marker should NOT exist (no pre-restore snapshot was taken)
+if [ -f ".earwig/RESTORING" ]; then
+    fail "RESTORING marker not written when no pre-restore snapshot" "marker file exists"
+else
+    pass "RESTORING marker not written when no changes"
+fi
+
+# =========================================================
+# TEST 32: earwig forget command (S7)
+# =========================================================
+blue "=== TEST 32: earwig forget ==="
+
+init_project /tmp/earwig-test-32
+
+write_file "a.txt" "version1"
+snapshot                                        # snapshot #1
+
+write_file "a.txt" "version2"
+snapshot                                        # snapshot #2
+
+write_file "a.txt" "version3"
+snapshot                                        # snapshot #3
+
+expect_snapshot_count 3
+
+# Forget snapshot #2 (middle of chain)
+forget_output=$(earwig forget "${SNAPSHOTS[1]}" 2>&1)
+if echo "$forget_output" | grep -q "Forgot snapshot"; then
+    pass "forget reports success"
+else
+    fail "forget reports success" "output: $forget_output"
+fi
+
+# Snapshot count should be 2 now
+# (forget creates pre-restore snapshots during internal operations, so just check the forgotten one is gone)
+if earwig show "${SNAPSHOTS[1]}" 2>/dev/null; then
+    fail "forgotten snapshot should not be found" "still found"
+else
+    pass "forgotten snapshot is gone"
+fi
+
+# Snapshot #3 should still be restorable
+restore 3
+expect_file "a.txt" "version3"
+
+# Snapshot #1 should still be restorable
+restore 1
+expect_file "a.txt" "version1"
+
+# Forgetting HEAD should fail — HEAD is snapshot #1 after the restore above
+if earwig forget "${SNAPSHOTS[0]}" 2>/dev/null; then
+    fail "forget HEAD should fail" "succeeded"
+else
+    pass "forget HEAD rejected"
+fi
+
+# =========================================================
+# TEST 33: GC under flock (S8)
+# =========================================================
+blue "=== TEST 33: GC under flock ==="
+
+init_project /tmp/earwig-test-33
+
+write_file "a.txt" "content"
+snapshot                                        # snapshot #1
+
+# Insert orphan blob
+sqlite3 .earwig/earwig.db "INSERT INTO blobs (hash, data, encoding, size) VALUES ('abcdef1234567890abcdef12', X'6F727068616E', 'raw', 6);"
+
+# GC should work and not deadlock
+gc_output=$(earwig gc 2>&1)
+if echo "$gc_output" | grep -q "Removed 1 orphaned blob"; then
+    pass "gc works under flock"
+else
+    fail "gc works under flock" "output: $gc_output"
+fi
+
+# Normal operations still work after GC
+write_file "b.txt" "after gc"
+snapshot                                        # snapshot #2
+expect_snapshot_count 2
+
+# =========================================================
 # DONE
 # =========================================================
 summary

@@ -3,6 +3,7 @@ package snapshot
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nk/earwig/internal/ignore"
@@ -704,6 +705,108 @@ func TestRestoreDeletesFileInReadOnlyDir(t *testing.T) {
 	data, _ := os.ReadFile(filepath.Join(dir, "ro-dir", "keep.txt"))
 	if string(data) != "keep" {
 		t.Fatalf("keep.txt expected 'keep', got %q", data)
+	}
+}
+
+// S3: safePath rejects NUL bytes in paths.
+func TestSafePathRejectsNUL(t *testing.T) {
+	root := "/tmp/earwig-test-root"
+	_, err := safePath(root, "foo\x00bar.txt")
+	if err == nil {
+		t.Fatal("expected error for path with NUL byte, got nil")
+	}
+	if !strings.Contains(err.Error(), "NUL") {
+		t.Fatalf("expected NUL error, got: %v", err)
+	}
+}
+
+// S3: Restore rejects crafted snapshot with NUL byte in path.
+func TestRestoreRejectsNULInPath(t *testing.T) {
+	s, dir := setup(t)
+	writeFile(t, dir, "a.txt", "legit")
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap, _ := c.TakeSnapshot(nil, "first")
+
+	// Manually insert a snapshot with a NUL byte in the path
+	blobHash, _ := s.PutBlob([]byte("evil"))
+	malSnap, _ := s.CreateSnapshot(&snap.ID, []store.SnapshotFile{
+		{Path: "a.txt", BlobHash: blobHash, Mode: 0644, Size: 4, Type: "file"},
+		{Path: "evil\x00.txt", BlobHash: blobHash, Mode: 0644, Size: 4, Type: "file"},
+	}, "nul-attack")
+
+	restorer := NewRestorer(s, dir, ig)
+	err := restorer.Restore(malSnap.ID)
+	if err == nil {
+		t.Fatal("expected error restoring snapshot with NUL in path, got nil")
+	}
+}
+
+// S9: readFile rejects non-regular files (via IsRegular check after fstat).
+// Symlink filtering is handled by the caller (Lstat), but if a directory is
+// passed to readFile it should be caught by the fstat check.
+func TestReadFileRejectsDirectory(t *testing.T) {
+	s, dir := setup(t)
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+
+	subDir := filepath.Join(dir, "subdir")
+	os.MkdirAll(subDir, 0755)
+
+	_, err := c.readFile(subDir, "subdir")
+	if err == nil {
+		t.Fatal("readFile should reject directories")
+	}
+	if !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("expected 'not a regular file' error, got: %v", err)
+	}
+}
+
+// S10: Restore preserves read-only parent dir permissions after deleting a file.
+func TestRestorePreservesReadOnlyDirPerms(t *testing.T) {
+	s, dir := setup(t)
+
+	writeFile(t, dir, "ro-dir/keep.txt", "keep")
+	writeFile(t, dir, "ro-dir/delete-me.txt", "gone")
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap1, _ := c.TakeSnapshot(nil, "with-both")
+
+	// Remove delete-me.txt and snapshot
+	os.Remove(filepath.Join(dir, "ro-dir", "delete-me.txt"))
+	snap2, err := c.TakeSnapshot(&snap1.ID, "without-delete-me")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Restore snap1 (both files), then make dir read-only
+	restorer := NewRestorer(s, dir, ig)
+	if err := restorer.Restore(snap1.ID); err != nil {
+		t.Fatalf("Restore to snap1: %v", err)
+	}
+	roDirPath := filepath.Join(dir, "ro-dir")
+	os.Chmod(roDirPath, 0555)
+	t.Cleanup(func() { os.Chmod(roDirPath, 0755) })
+
+	// Restore snap2 — must delete delete-me.txt from read-only dir
+	if err := restorer.Restore(snap2.ID); err != nil {
+		t.Fatalf("Restore with read-only parent dir: %v", err)
+	}
+
+	// delete-me.txt should be gone
+	if _, err := os.Stat(filepath.Join(roDirPath, "delete-me.txt")); err == nil {
+		t.Fatal("delete-me.txt should have been removed")
+	}
+
+	// The directory should still be 0555 (permissions restored after chmod)
+	info, err := os.Stat(roDirPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0555 {
+		t.Fatalf("ro-dir should be 0555 after restore, got %04o", info.Mode().Perm())
 	}
 }
 

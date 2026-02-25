@@ -701,3 +701,146 @@ func TestCorruptModTimeGetSnapshotFiles(t *testing.T) {
 		t.Fatalf("expected corrupt mod_time error, got: %v", err)
 	}
 }
+
+// S1: Snapshot hash includes mode and type — changing either produces a different hash.
+func TestSnapshotHashIncludesMode(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("content"))
+	now := time.Now()
+
+	snap1, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+	}, "mode-644")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snap2, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0755, ModTime: now, Size: 7, Type: "file"},
+	}, "mode-755")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if snap1.Hash == snap2.Hash {
+		t.Fatal("snapshots with different modes should have different hashes")
+	}
+}
+
+func TestSnapshotHashIncludesType(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("target"))
+	now := time.Now()
+
+	snap1, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 6, Type: "file"},
+	}, "as-file")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snap2, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 6, Type: "symlink"},
+	}, "as-symlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if snap1.Hash == snap2.Hash {
+		t.Fatal("snapshots with different types should have different hashes")
+	}
+}
+
+// S6: CreateSnapshot rejects path conflicts (file and directory at same path).
+func TestCreateSnapshotRejectsPathConflict(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("content"))
+	now := time.Now()
+
+	_, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "foo", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+		{Path: "foo/bar.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+	}, "conflicting")
+	if err == nil {
+		t.Fatal("expected error for path conflict, got nil")
+	}
+	if !strings.Contains(err.Error(), "path conflict") {
+		t.Fatalf("expected path conflict error, got: %v", err)
+	}
+}
+
+func TestCreateSnapshotAllowsNonConflictingPaths(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("content"))
+	now := time.Now()
+
+	// "foo.txt" and "foobar/baz.txt" should NOT conflict (foo.txt/ is not a prefix of foobar/)
+	_, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "foo.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+		{Path: "foobar/baz.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+	}, "non-conflicting")
+	if err != nil {
+		t.Fatalf("non-conflicting paths should be accepted: %v", err)
+	}
+}
+
+// S7: DeleteSnapshot removes snapshot and re-parents children.
+func TestDeleteSnapshot(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("content"))
+	now := time.Now()
+
+	// Create a chain: snap1 -> snap2 -> snap3
+	snap1, _ := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+	}, "first")
+	snap2, _ := s.CreateSnapshot(&snap1.ID, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0755, ModTime: now, Size: 7, Type: "file"},
+	}, "second")
+	snap3, _ := s.CreateSnapshot(&snap2.ID, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+	}, "third")
+
+	// Delete the middle snapshot
+	if err := s.DeleteSnapshot(snap2.ID); err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+
+	// snap2 should be gone
+	_, err := s.GetSnapshot(snap2.Hash)
+	if err == nil {
+		t.Fatal("deleted snapshot should not be found")
+	}
+
+	// snap3 should be re-parented to snap1
+	got, err := s.GetSnapshot(snap3.Hash)
+	if err != nil {
+		t.Fatalf("snap3 lookup: %v", err)
+	}
+	if got.ParentID == nil || *got.ParentID != snap1.ID {
+		t.Fatalf("snap3 should be re-parented to snap1, got parent %v", got.ParentID)
+	}
+}
+
+func TestDeleteSnapshotReparentsToNull(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("content"))
+	now := time.Now()
+
+	snap1, _ := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+	}, "root")
+	snap2, _ := s.CreateSnapshot(&snap1.ID, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0755, ModTime: now, Size: 7, Type: "file"},
+	}, "child")
+
+	// Delete the root
+	if err := s.DeleteSnapshot(snap1.ID); err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+
+	got, _ := s.GetSnapshot(snap2.Hash)
+	if got.ParentID != nil {
+		t.Fatalf("snap2 should have nil parent after root deleted, got %v", got.ParentID)
+	}
+}
