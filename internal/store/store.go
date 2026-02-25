@@ -37,7 +37,7 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("creating zstd encoder: %w", err)
 	}
-	dec, err := zstd.NewReader(nil)
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(512*1024*1024))
 	if err != nil {
 		db.Close()
 		enc.Close()
@@ -90,19 +90,41 @@ func (s *Store) PutBlob(data []byte) (string, error) {
 	return hash, nil
 }
 
+// maxBlobSize is the maximum uncompressed blob size we'll accept from the DB.
+// This prevents decompression bombs (a small compressed blob expanding to
+// gigabytes) and rejects obviously corrupt size values.
+const maxBlobSize = 512 * 1024 * 1024 // 512MB
+
 func (s *Store) GetBlob(hash string) ([]byte, error) {
 	var data []byte
 	var encoding string
-	err := s.db.QueryRow(`SELECT data, encoding FROM blobs WHERE hash = ?`, hash).Scan(&data, &encoding)
+	var size int64
+	err := s.db.QueryRow(`SELECT data, encoding, size FROM blobs WHERE hash = ?`, hash).Scan(&data, &encoding, &size)
 	if err != nil {
 		return nil, fmt.Errorf("getting blob %s: %w", hash, err)
 	}
+
+	if size > maxBlobSize {
+		return nil, fmt.Errorf("blob %s: stored size %d exceeds maximum %d", hash, size, maxBlobSize)
+	}
+
 	if encoding == "zstd" {
-		data, err = s.zstdDec.DecodeAll(data, nil)
+		decoded, err := s.zstdDec.DecodeAll(data, make([]byte, 0, size))
 		if err != nil {
 			return nil, fmt.Errorf("decompressing blob %s: %w", hash, err)
 		}
+		if int64(len(decoded)) != size {
+			return nil, fmt.Errorf("blob %s: decompressed size %d != stored size %d", hash, len(decoded), size)
+		}
+		data = decoded
 	}
+
+	// Verify content hash to detect DB corruption or tampering.
+	actual := sha256.Sum256(data)
+	if hex.EncodeToString(actual[:]) != hash {
+		return nil, fmt.Errorf("blob %s: integrity check failed (actual hash %s)", hash, hex.EncodeToString(actual[:]))
+	}
+
 	return data, nil
 }
 
@@ -170,6 +192,9 @@ func (s *Store) CreateSnapshot(parentID *int64, files []SnapshotFile, message st
 		if fileType == "" {
 			fileType = "file"
 		}
+		if fileType != "file" && fileType != "symlink" {
+			return nil, fmt.Errorf("invalid file type %q for %s", fileType, f.Path)
+		}
 		_, err := stmt.Exec(id, f.Path, f.BlobHash, f.Mode, f.ModTime.Format(time.RFC3339), f.Size, fileType)
 		if err != nil {
 			return nil, fmt.Errorf("inserting snapshot file %s: %w", f.Path, err)
@@ -212,7 +237,11 @@ func (s *Store) GetSnapshot(hashPrefix string) (*Snapshot, error) {
 		if parentID.Valid {
 			snap.ParentID = &parentID.Int64
 		}
-		snap.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		var parseErr error
+		snap.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
+		if parseErr != nil {
+			return nil, fmt.Errorf("corrupt timestamp %q in snapshot %s: %w", createdAt, snap.Hash, parseErr)
+		}
 		results = append(results, snap)
 	}
 	if err := rows.Err(); err != nil {
@@ -246,7 +275,11 @@ func (s *Store) GetSnapshotFiles(snapshotID int64) ([]SnapshotFile, error) {
 		if err := rows.Scan(&f.Path, &f.BlobHash, &f.Mode, &modTime, &f.Size, &f.Type); err != nil {
 			return nil, err
 		}
-		f.ModTime, _ = time.Parse(time.RFC3339, modTime)
+		var parseErr error
+		f.ModTime, parseErr = time.Parse(time.RFC3339, modTime)
+		if parseErr != nil {
+			return nil, fmt.Errorf("corrupt mod_time %q for %s: %w", modTime, f.Path, parseErr)
+		}
 		files = append(files, f)
 	}
 	if err := rows.Err(); err != nil {
@@ -275,7 +308,11 @@ func (s *Store) ListSnapshots() ([]Snapshot, error) {
 		if parentID.Valid {
 			snap.ParentID = &parentID.Int64
 		}
-		snap.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		var parseErr error
+		snap.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
+		if parseErr != nil {
+			return nil, fmt.Errorf("corrupt timestamp %q in snapshot %d: %w", createdAt, snap.ID, parseErr)
+		}
 		snapshots = append(snapshots, snap)
 	}
 	if err := rows.Err(); err != nil {
@@ -300,8 +337,22 @@ func (s *Store) GetLatestSnapshot() (*Snapshot, error) {
 	if parentID.Valid {
 		snap.ParentID = &parentID.Int64
 	}
-	snap.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	var parseErr error
+	snap.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
+	if parseErr != nil {
+		return nil, fmt.Errorf("corrupt timestamp %q in snapshot %d: %w", createdAt, snap.ID, parseErr)
+	}
 	return &snap, nil
+}
+
+// GarbageCollect removes blobs not referenced by any snapshot_files row.
+// Returns the number of orphaned blobs deleted.
+func (s *Store) GarbageCollect() (int64, error) {
+	result, err := s.db.Exec(`DELETE FROM blobs WHERE hash NOT IN (SELECT DISTINCT blob_hash FROM snapshot_files)`)
+	if err != nil {
+		return 0, fmt.Errorf("garbage collecting blobs: %w", err)
+	}
+	return result.RowsAffected()
 }
 
 func (s *Store) DiffSnapshots(oldID, newID int64) ([]FileChange, error) {

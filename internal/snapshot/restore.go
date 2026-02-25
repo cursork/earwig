@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/nk/earwig/internal/ignore"
 	"github.com/nk/earwig/internal/store"
@@ -152,8 +153,11 @@ func (r *Restorer) Restore(snapshotID int64) error {
 
 		switch f.Type {
 		case "symlink":
-			// Blob content is the symlink target path
-			if err := os.Symlink(string(data), absPath); err != nil {
+			target := string(data)
+			if filepath.IsAbs(target) || strings.Contains(target, "..") {
+				fmt.Fprintf(os.Stderr, "warning: symlink %s has potentially unsafe target: %s\n", f.Path, target)
+			}
+			if err := os.Symlink(target, absPath); err != nil {
 				return err
 			}
 		case "file", "":
@@ -227,9 +231,13 @@ func splitPath(path string) []string {
 	for path != "" && path != "." {
 		dir, file := filepath.Split(path)
 		if file != "" {
-			parts = append([]string{file}, parts...)
+			parts = append(parts, file)
 		}
 		path = filepath.Clean(dir)
+	}
+	// Reverse to get root-to-leaf order
+	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+		parts[i], parts[j] = parts[j], parts[i]
 	}
 	return parts
 }

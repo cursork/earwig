@@ -3,6 +3,7 @@ package ignore
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -103,6 +104,26 @@ func TestMissingIgnoreFile(t *testing.T) {
 	}
 	if m.Match("src/main.go") {
 		t.Error("expected src/main.go to not be ignored")
+	}
+}
+
+func TestNonENOENTError(t *testing.T) {
+	// Create a file, then make it unreadable (non-ENOENT error)
+	dir := t.TempDir()
+	ignoreFile := filepath.Join(dir, "ignore")
+	if err := os.WriteFile(ignoreFile, []byte("*.log\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(ignoreFile, 0000); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := New([]string{ignoreFile})
+	if err == nil {
+		t.Fatal("expected error for unreadable ignore file, got nil")
+	}
+	if !strings.Contains(err.Error(), "reading ignore file") {
+		t.Fatalf("expected 'reading ignore file' error, got: %v", err)
 	}
 }
 

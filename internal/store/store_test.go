@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -481,5 +482,222 @@ func TestDiffSnapshotsModeChange(t *testing.T) {
 	}
 	if changes[0].Type != ChangeModified {
 		t.Fatalf("expected ChangeModified, got %v", changes[0].Type)
+	}
+}
+
+func TestGetBlobVerifiesHash(t *testing.T) {
+	s := testStore(t)
+	data := []byte("hello world")
+
+	hash, err := s.PutBlob(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Tamper with the blob data in the DB
+	_, err = s.db.Exec(`UPDATE blobs SET data = ? WHERE hash = ?`, []byte("tampered"), hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// GetBlob should detect the hash mismatch
+	_, err = s.GetBlob(hash)
+	if err == nil {
+		t.Fatal("expected error for tampered blob, got nil")
+	}
+	if !strings.Contains(err.Error(), "integrity check failed") {
+		t.Fatalf("expected integrity check error, got: %v", err)
+	}
+}
+
+func TestGetBlobRejectsOversizedBlob(t *testing.T) {
+	s := testStore(t)
+	data := []byte("small data")
+
+	hash, err := s.PutBlob(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set a huge size value in the DB to simulate a decompression bomb
+	_, err = s.db.Exec(`UPDATE blobs SET size = ? WHERE hash = ?`, maxBlobSize+1, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.GetBlob(hash)
+	if err == nil {
+		t.Fatal("expected error for oversized blob, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("expected size exceeded error, got: %v", err)
+	}
+}
+
+func TestCreateSnapshotValidatesType(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("content"))
+	now := time.Now()
+
+	// Valid types should work
+	_, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+	}, "valid file")
+	if err != nil {
+		t.Fatalf("file type should be valid: %v", err)
+	}
+
+	// Empty type defaults to "file" — should work
+	snap2, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "b.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: ""},
+	}, "empty type")
+	if err != nil {
+		t.Fatalf("empty type should default to file: %v", err)
+	}
+	files, _ := s.GetSnapshotFiles(snap2.ID)
+	if files[0].Type != "file" {
+		t.Fatalf("expected type 'file', got %q", files[0].Type)
+	}
+
+	// Invalid type should fail
+	_, err = s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "c.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "unknown"},
+	}, "invalid type")
+	if err == nil {
+		t.Fatal("expected error for invalid file type 'unknown'")
+	}
+}
+
+func TestGarbageCollect(t *testing.T) {
+	s := testStore(t)
+
+	// Store a blob that's referenced by a snapshot
+	h1, _ := s.PutBlob([]byte("referenced"))
+	now := time.Now()
+	s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h1, Mode: 0644, ModTime: now, Size: 10, Type: "file"},
+	}, "snap")
+
+	// Store an orphaned blob (not referenced by any snapshot)
+	h2, _ := s.PutBlob([]byte("orphaned"))
+
+	// Verify both blobs exist
+	var count int
+	s.db.QueryRow(`SELECT COUNT(*) FROM blobs`).Scan(&count)
+	if count != 2 {
+		t.Fatalf("expected 2 blobs, got %d", count)
+	}
+
+	// GC should remove the orphaned blob
+	removed, err := s.GarbageCollect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("expected 1 removed, got %d", removed)
+	}
+
+	// Referenced blob should still exist
+	_, err = s.GetBlob(h1)
+	if err != nil {
+		t.Fatalf("referenced blob should survive GC: %v", err)
+	}
+
+	// Orphaned blob should be gone
+	_, err = s.GetBlob(h2)
+	if err == nil {
+		t.Fatal("orphaned blob should have been removed by GC")
+	}
+}
+
+func TestCorruptTimestampGetSnapshot(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("data"))
+	now := time.Now()
+	snap, _ := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 4, Type: "file"},
+	}, "test")
+
+	// Corrupt the created_at timestamp
+	_, err := s.db.Exec(`UPDATE snapshots SET created_at = 'not-a-date' WHERE id = ?`, snap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.GetSnapshot(snap.Hash)
+	if err == nil {
+		t.Fatal("expected error for corrupt timestamp in GetSnapshot")
+	}
+	if !strings.Contains(err.Error(), "corrupt timestamp") {
+		t.Fatalf("expected corrupt timestamp error, got: %v", err)
+	}
+}
+
+func TestCorruptTimestampListSnapshots(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("data"))
+	now := time.Now()
+	s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 4, Type: "file"},
+	}, "test")
+
+	// Corrupt the timestamp
+	_, err := s.db.Exec(`UPDATE snapshots SET created_at = 'garbage'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.ListSnapshots()
+	if err == nil {
+		t.Fatal("expected error for corrupt timestamp in ListSnapshots")
+	}
+	if !strings.Contains(err.Error(), "corrupt timestamp") {
+		t.Fatalf("expected corrupt timestamp error, got: %v", err)
+	}
+}
+
+func TestCorruptTimestampGetLatestSnapshot(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("data"))
+	now := time.Now()
+	s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 4, Type: "file"},
+	}, "test")
+
+	// Corrupt the timestamp
+	_, err := s.db.Exec(`UPDATE snapshots SET created_at = 'garbage'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.GetLatestSnapshot()
+	if err == nil {
+		t.Fatal("expected error for corrupt timestamp in GetLatestSnapshot")
+	}
+	if !strings.Contains(err.Error(), "corrupt timestamp") {
+		t.Fatalf("expected corrupt timestamp error, got: %v", err)
+	}
+}
+
+func TestCorruptModTimeGetSnapshotFiles(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("data"))
+	now := time.Now()
+	snap, _ := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 4, Type: "file"},
+	}, "test")
+
+	// Corrupt the mod_time timestamp
+	_, err := s.db.Exec(`UPDATE snapshot_files SET mod_time = 'bad-time' WHERE snapshot_id = ?`, snap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.GetSnapshotFiles(snap.ID)
+	if err == nil {
+		t.Fatal("expected error for corrupt mod_time in GetSnapshotFiles")
+	}
+	if !strings.Contains(err.Error(), "corrupt mod_time") {
+		t.Fatalf("expected corrupt mod_time error, got: %v", err)
 	}
 }

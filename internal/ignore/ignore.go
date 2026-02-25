@@ -1,6 +1,7 @@
 package ignore
 
 import (
+	"fmt"
 	"os"
 	"strings"
 
@@ -21,7 +22,10 @@ func New(ignoreFiles []string) (*Matcher, error) {
 	for _, path := range ignoreFiles {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			continue // Skip unreadable files
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("reading ignore file %s: %w", path, err)
 		}
 		lines := strings.Split(string(data), "\n")
 		ig := gitignore.CompileIgnoreLines(lines...)

@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,12 @@ import (
 	"github.com/nk/earwig/internal/ignore"
 	"github.com/nk/earwig/internal/store"
 )
+
+// maxFileSize is the maximum file size we'll snapshot. Larger files are
+// skipped with a warning to prevent OOM from os.ReadFile loading the
+// entire file into memory. Set to -1 to disable the limit (at your own risk).
+// To change, edit this value and recompile.
+const maxFileSize int64 = -1 // no limit by default; set to e.g. 100*1024*1024 for 100MB
 
 type Creator struct {
 	store   *store.Store
@@ -77,6 +84,16 @@ func (c *Creator) TakeSnapshot(parentID *int64, message string) (*store.Snapshot
 			return nil
 		}
 
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if maxFileSize >= 0 && info.Size() > maxFileSize {
+			fmt.Fprintf(os.Stderr, "warning: skipping %s (%.1f MB exceeds %d MB limit)\n",
+				relPath, float64(info.Size())/(1024*1024), maxFileSize/(1024*1024))
+			return nil
+		}
+
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil // Skip unreadable files
@@ -85,11 +102,6 @@ func (c *Creator) TakeSnapshot(parentID *int64, message string) (*store.Snapshot
 		blobHash, err := c.store.PutBlob(data)
 		if err != nil {
 			return err
-		}
-
-		info, err := d.Info()
-		if err != nil {
-			return nil
 		}
 
 		files = append(files, store.SnapshotFile{
@@ -226,17 +238,20 @@ func (c *Creator) TakeIncrementalSnapshot(parentID int64, changedPaths map[strin
 
 // readFile reads a regular file, stores its blob, and returns a SnapshotFile.
 func (c *Creator) readFile(absPath, relPath string) (store.SnapshotFile, error) {
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return store.SnapshotFile{}, err
+	}
+	if maxFileSize >= 0 && info.Size() > maxFileSize {
+		return store.SnapshotFile{}, fmt.Errorf("file too large: %s (%.1f MB)", relPath, float64(info.Size())/(1024*1024))
+	}
+
 	data, err := os.ReadFile(absPath)
 	if err != nil {
 		return store.SnapshotFile{}, err
 	}
 
 	blobHash, err := c.store.PutBlob(data)
-	if err != nil {
-		return store.SnapshotFile{}, err
-	}
-
-	info, err := os.Stat(absPath)
 	if err != nil {
 		return store.SnapshotFile{}, err
 	}

@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,6 +27,7 @@ var commands = map[string]func([]string) error{
 	"show":     cmdShow,
 	"watch":    cmdWatch,
 	"restore":  cmdRestore,
+	"gc":       cmdGC,
 	"_files":   cmdFiles,
 }
 
@@ -47,6 +48,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func shortHash(hash string) string {
+	if len(hash) <= 12 {
+		return hash
+	}
+	return hash[:12]
 }
 
 func usage() {
@@ -70,8 +78,14 @@ func findRoot() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	cwd := dir
+	levels := 0
 	for {
 		if _, err := os.Stat(filepath.Join(dir, ".earwig")); err == nil {
+			if levels > 2 {
+				rel, _ := filepath.Rel(dir, cwd)
+				fmt.Fprintf(os.Stderr, "warning: earwig root is %d levels above cwd (%s from %s)\n", levels, dir, rel)
+			}
 			return dir, nil
 		}
 		parent := filepath.Dir(dir)
@@ -79,6 +93,7 @@ func findRoot() (string, error) {
 			return "", fmt.Errorf("not an earwig directory (or any parent): .earwig not found")
 		}
 		dir = parent
+		levels++
 	}
 }
 
@@ -87,11 +102,24 @@ func openStore() (*store.Store, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	checkRestoreRecovery(root)
 	s, err := store.Open(filepath.Join(root, ".earwig", "earwig.db"))
 	if err != nil {
 		return nil, "", err
 	}
 	return s, root, nil
+}
+
+// checkRestoreRecovery warns if a previous restore was interrupted.
+func checkRestoreRecovery(root string) {
+	markerPath := filepath.Join(root, ".earwig", "RESTORING")
+	data, err := os.ReadFile(markerPath)
+	if err != nil {
+		return
+	}
+	hash := strings.TrimSpace(string(data))
+	fmt.Fprintf(os.Stderr, "warning: a previous restore was interrupted. Pre-restore state saved as snapshot %s.\n", hash)
+	fmt.Fprintf(os.Stderr, "Run 'earwig restore %s' to recover, or delete .earwig/RESTORING to dismiss.\n", hash)
 }
 
 func loadIgnore(root string) (*ignore.Matcher, error) {
@@ -161,7 +189,7 @@ func cmdSnapshot(args []string) error {
 	if err := writeHead(root, snap.ID); err != nil {
 		return fmt.Errorf("writing HEAD: %w", err)
 	}
-	fmt.Printf("Snapshot %s\n", snap.Hash[:12])
+	fmt.Printf("Snapshot %s\n", shortHash(snap.Hash))
 	return nil
 }
 
@@ -199,7 +227,7 @@ func cmdLog(args []string) error {
 			}
 		}
 		fmt.Printf("* %s  %s  %s%s\n",
-			snap.Hash[:12],
+			shortHash(snap.Hash),
 			snap.CreatedAt.Format("2006-01-02 15:04:05"),
 			snap.Message,
 			branchMark,
@@ -224,7 +252,7 @@ func cmdShow(args []string) error {
 		return err
 	}
 
-	fmt.Printf("Snapshot %s\n", snap.Hash[:12])
+	fmt.Printf("Snapshot %s\n", shortHash(snap.Hash))
 	fmt.Printf("Date:    %s\n", snap.CreatedAt.Format("2006-01-02 15:04:05"))
 	fmt.Printf("Message: %s\n\n", snap.Message)
 
@@ -325,86 +353,36 @@ func writeHead(root string, id int64) error {
 	return os.Rename(tmpPath, headPath)
 }
 
-// Lock file: prevents watcher from snapshotting during restore
+// File lock: prevents watcher from snapshotting during restore.
+// Uses syscall.Flock for real mutual exclusion — no TOCTOU race.
+// The flock file is persistent (never removed) so it can always be locked.
 
-func lockPath(root string) string {
-	return filepath.Join(root, ".earwig", "LOCK")
+func flockPath(root string) string {
+	return filepath.Join(root, ".earwig", "flock")
 }
 
-func acquireLock(root string) error {
-	content := fmt.Sprintf("%d %d", os.Getpid(), time.Now().Unix())
-	p := lockPath(root)
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+// acquireFlock acquires an exclusive file lock on .earwig/flock.
+// If blocking is true, waits until the lock is available.
+// Returns the locked file (caller must Close() to release) or nil if
+// non-blocking and the lock is held by another process.
+func acquireFlock(root string, blocking bool) (*os.File, error) {
+	p := flockPath(root)
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		if !os.IsExist(err) {
-			return err
-		}
-		// File exists — check if stale
-		if isLocked(root) {
-			return fmt.Errorf("another earwig process holds the lock")
-		}
-		// Stale lock — remove and retry once
-		os.Remove(p)
-		f, err = os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-		if err != nil {
-			return err
-		}
+		return nil, fmt.Errorf("opening flock: %w", err)
 	}
-	if _, err = f.WriteString(content); err != nil {
+	how := syscall.LOCK_EX
+	if !blocking {
+		how |= syscall.LOCK_NB
+	}
+	if err := syscall.Flock(int(f.Fd()), how); err != nil {
 		f.Close()
-		os.Remove(p)
-		return err
-	}
-	if err = f.Close(); err != nil {
-		os.Remove(p)
-		return err
-	}
-	return nil
-}
-
-func releaseLock(root string) {
-	os.Remove(lockPath(root))
-}
-
-// isLocked returns true if a live restore process holds the lock.
-// Removes stale locks from dead processes or locks older than 5 minutes.
-func isLocked(root string) bool {
-	p := lockPath(root)
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return false
-	}
-	parts := strings.Fields(string(data))
-	if len(parts) < 1 {
-		return false
-	}
-	pid, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return false
-	}
-
-	// Age-based staleness: locks older than 5 minutes are stale
-	if len(parts) >= 2 {
-		if ts, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
-			if time.Since(time.Unix(ts, 0)) > 5*time.Minute {
-				os.Remove(p)
-				return false
-			}
+		if !blocking && (errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN)) {
+			return nil, nil // lock held by another process
 		}
+		return nil, fmt.Errorf("acquiring flock: %w", err)
 	}
-
-	// Check if process is still alive
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		os.Remove(p)
-		return false
-	}
-	// On Unix, FindProcess always succeeds. Signal 0 checks if process exists.
-	if err := proc.Signal(syscall.Signal(0)); err != nil {
-		os.Remove(p)
-		return false
-	}
-	return true
+	return f, nil
 }
 
 func cmdWatch(args []string) error {
@@ -426,9 +404,16 @@ func cmdWatch(args []string) error {
 	)
 
 	takeSnap := func() {
-		if isLocked(root) {
+		// Acquire flock non-blocking — if restore holds it, skip this cycle.
+		flockFile, err := acquireFlock(root, false)
+		if err != nil {
+			log.Printf("error acquiring flock: %v", err)
 			return
 		}
+		if flockFile == nil {
+			return // restore in progress
+		}
+		defer flockFile.Close()
 
 		parentID, err := readHead(root, s)
 		if err != nil {
@@ -445,18 +430,6 @@ func cmdWatch(args []string) error {
 		paths := changedPaths
 		changedPaths = make(map[string]bool)
 		mu.Unlock()
-
-		// Re-check lock after swap — a restore may have started between
-		// the first check and now.
-		if isLocked(root) {
-			// Put paths back so they're picked up on the next cycle
-			mu.Lock()
-			for p := range paths {
-				changedPaths[p] = true
-			}
-			mu.Unlock()
-			return
-		}
 
 		// Every 10th snapshot or if no parent, do a full walk for consistency
 		snapCount++
@@ -477,7 +450,7 @@ func cmdWatch(args []string) error {
 			log.Printf("error writing HEAD: %v", err)
 			return
 		}
-		fmt.Printf("[%s] Snapshot %s\n", snap.CreatedAt.Format("15:04:05"), snap.Hash[:12])
+		fmt.Printf("[%s] Snapshot %s\n", snap.CreatedAt.Format("15:04:05"), shortHash(snap.Hash))
 	}
 
 	// Initial snapshot (always full walk)
@@ -527,10 +500,12 @@ func cmdRestore(args []string) error {
 		return err
 	}
 
-	if err := acquireLock(root); err != nil {
+	// Acquire exclusive flock — blocks until watcher snapshot finishes.
+	flockFile, err := acquireFlock(root, true)
+	if err != nil {
 		return fmt.Errorf("acquiring lock: %w", err)
 	}
-	defer releaseLock(root)
+	defer flockFile.Close()
 
 	// Auto-snapshot current state before restore so the user can undo
 	parentID, err := readHead(root, s)
@@ -546,17 +521,47 @@ func cmdRestore(args []string) error {
 		if err := writeHead(root, preSnap.ID); err != nil {
 			return fmt.Errorf("writing HEAD: %w", err)
 		}
-		fmt.Printf("Saved current state as %s\n", preSnap.Hash[:12])
+		fmt.Printf("Saved current state as %s\n", shortHash(preSnap.Hash))
 	}
+
+	// Write RESTORING marker so a crash midway can be detected on next run.
+	restoreMarker := filepath.Join(root, ".earwig", "RESTORING")
+	preHash := ""
+	if preSnap != nil {
+		preHash = shortHash(preSnap.Hash)
+	}
+	os.WriteFile(restoreMarker, []byte(preHash), 0644)
 
 	restorer := snapshot.NewRestorer(s, root, ig)
 	if err := restorer.Restore(snap.ID); err != nil {
 		return err
 	}
 
+	// Restore succeeded — remove the marker.
+	os.Remove(restoreMarker)
+
 	if err := writeHead(root, snap.ID); err != nil {
 		return fmt.Errorf("writing HEAD: %w", err)
 	}
-	fmt.Printf("Restored to snapshot %s (%s)\n", snap.Hash[:12], snap.CreatedAt.Format("2006-01-02 15:04:05"))
+	fmt.Printf("Restored to snapshot %s (%s)\n", shortHash(snap.Hash), snap.CreatedAt.Format("2006-01-02 15:04:05"))
+	return nil
+}
+
+func cmdGC(args []string) error {
+	s, _, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	count, err := s.GarbageCollect()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		fmt.Println("No orphaned blobs.")
+	} else {
+		fmt.Printf("Removed %d orphaned blob(s).\n", count)
+	}
 	return nil
 }

@@ -346,13 +346,13 @@ snap_id=$(sqlite3 "$db" "SELECT id FROM snapshots ORDER BY id DESC LIMIT 1")
 blob_hash=$(sqlite3 "$db" "SELECT hash FROM blobs LIMIT 1")
 
 # Insert a new snapshot with a traversal path
-sqlite3 "$db" "INSERT INTO snapshots (hash, parent_id, created_at, message) VALUES ('deadbeef', $snap_id, datetime('now'), 'malicious')"
-mal_id=$(sqlite3 "$db" "SELECT id FROM snapshots WHERE hash='deadbeef'")
-sqlite3 "$db" "INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, mod_time, size) VALUES ($mal_id, '../earwig-canary', '$blob_hash', 420, datetime('now'), 5)"
-sqlite3 "$db" "INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, mod_time, size) VALUES ($mal_id, 'legit.txt', '$blob_hash', 420, datetime('now'), 5)"
+sqlite3 "$db" "INSERT INTO snapshots (hash, parent_id, created_at, message) VALUES ('deadbeefdeadbeefdeadbeef', $snap_id, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'malicious')"
+mal_id=$(sqlite3 "$db" "SELECT id FROM snapshots WHERE hash='deadbeefdeadbeefdeadbeef'")
+sqlite3 "$db" "INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, mod_time, size, type) VALUES ($mal_id, '../earwig-canary', '$blob_hash', 420, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 5, 'file')"
+sqlite3 "$db" "INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, mod_time, size, type) VALUES ($mal_id, 'legit.txt', '$blob_hash', 420, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 5, 'file')"
 
 # Attempt restore — should fail
-if earwig restore deadbeef 2>/dev/null; then
+if earwig restore deadbeefdeadbeefdeadbeef 2>/dev/null; then
     fail "restore with traversal path should fail" "restore succeeded"
 else
     pass "restore with traversal path rejected"
@@ -850,6 +850,230 @@ expect_file_mode "ro.txt" "644"
 restore 2
 expect_file "ro.txt" "version2"
 expect_file_mode "ro.txt" "444"
+
+# =========================================================
+# TEST 24: Crafted DB — .earwig/ injection
+# =========================================================
+blue "=== TEST 24: Crafted DB injection ==="
+
+init_project /tmp/earwig-test-24
+
+write_file "legit.txt" "legit"
+snapshot                                        # snapshot #1
+
+db=".earwig/earwig.db"
+snap_id=$(sqlite3 "$db" "SELECT id FROM snapshots ORDER BY id DESC LIMIT 1")
+blob_hash=$(sqlite3 "$db" "SELECT hash FROM blobs LIMIT 1")
+
+# Insert a malicious snapshot with .earwig/evil.txt
+sqlite3 "$db" "INSERT INTO snapshots (hash, parent_id, created_at, message) VALUES ('cafebabecafebabecafebabe', $snap_id, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'crafted')"
+mal_id=$(sqlite3 "$db" "SELECT id FROM snapshots WHERE hash='cafebabecafebabecafebabe'")
+sqlite3 "$db" "INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, mod_time, size, type) VALUES ($mal_id, '.earwig/evil.txt', '$blob_hash', 420, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 5, 'file')"
+sqlite3 "$db" "INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, mod_time, size, type) VALUES ($mal_id, 'legit.txt', '$blob_hash', 420, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 5, 'file')"
+
+# Restore the malicious snapshot
+earwig restore cafebabecafebabecafebabe > /dev/null 2>&1
+
+# .earwig/evil.txt must NOT exist
+if [ -f ".earwig/evil.txt" ]; then
+    fail ".earwig/evil.txt should not exist" "file was created by crafted DB"
+else
+    pass ".earwig/evil.txt rejected by ignore matcher"
+fi
+
+# legit.txt should be restored normally
+if [ -f "legit.txt" ]; then
+    pass "legit.txt restored from crafted snapshot"
+else
+    fail "legit.txt restored from crafted snapshot" "file not found"
+fi
+
+# =========================================================
+# TEST 25: RESTORING marker recovery warning
+# =========================================================
+blue "=== TEST 25: RESTORING marker ==="
+
+init_project /tmp/earwig-test-25
+
+write_file "a.txt" "content"
+snapshot                                        # snapshot #1
+
+# Simulate a crashed restore by writing a RESTORING marker
+printf 'abc123def456' > ".earwig/RESTORING"
+
+# Any earwig command should print the recovery warning to stderr
+warn_output=$(earwig log 2>&1 >/dev/null || true)
+if echo "$warn_output" | grep -q "previous restore was interrupted"; then
+    pass "RESTORING marker triggers warning"
+else
+    fail "RESTORING marker triggers warning" "no warning in stderr: $warn_output"
+fi
+
+# Clean up marker
+rm -f ".earwig/RESTORING"
+
+# Normal operations should work after cleanup
+earwig log > /dev/null 2>&1
+pass "earwig works after RESTORING cleanup"
+
+# =========================================================
+# TEST 26: earwig gc command
+# =========================================================
+blue "=== TEST 26: GC command ==="
+
+init_project /tmp/earwig-test-26
+
+write_file "a.txt" "keep me"
+snapshot                                        # snapshot #1
+
+# Manually insert an orphaned blob into the DB
+sqlite3 .earwig/earwig.db "INSERT INTO blobs (hash, data, encoding, size) VALUES ('deadbeefdeadbeefdeadbeefdeadbeef', X'6F727068616E', 'raw', 6);"
+
+# Verify it exists
+orphan_count=$(sqlite3 .earwig/earwig.db "SELECT COUNT(*) FROM blobs WHERE hash = 'deadbeefdeadbeefdeadbeefdeadbeef';")
+if [ "$orphan_count" = "1" ]; then
+    pass "orphan blob inserted"
+else
+    fail "orphan blob inserted" "count = $orphan_count"
+fi
+
+# Run GC
+gc_output=$(earwig gc 2>&1)
+if echo "$gc_output" | grep -q "Removed 1 orphaned blob"; then
+    pass "gc reports 1 orphaned blob removed"
+else
+    fail "gc reports 1 orphaned blob removed" "output: $gc_output"
+fi
+
+# Orphan should be gone
+orphan_count=$(sqlite3 .earwig/earwig.db "SELECT COUNT(*) FROM blobs WHERE hash = 'deadbeefdeadbeefdeadbeefdeadbeef';")
+if [ "$orphan_count" = "0" ]; then
+    pass "orphan blob deleted by gc"
+else
+    fail "orphan blob deleted by gc" "count = $orphan_count"
+fi
+
+# Referenced blob should survive
+ref_count=$(sqlite3 .earwig/earwig.db "SELECT COUNT(*) FROM blobs b INNER JOIN snapshot_files sf ON b.hash = sf.blob_hash;")
+if [ "$ref_count" -ge "1" ]; then
+    pass "referenced blob survived gc"
+else
+    fail "referenced blob survived gc" "count = $ref_count"
+fi
+
+# Running GC again should find nothing
+gc_output2=$(earwig gc 2>&1)
+if echo "$gc_output2" | grep -q "No orphaned blobs"; then
+    pass "gc reports no orphans on second run"
+else
+    fail "gc reports no orphans on second run" "output: $gc_output2"
+fi
+
+# earwig should still work normally after GC
+write_file "b.txt" "after gc"
+snapshot                                        # snapshot #2
+expect_snapshot_count 2
+
+# =========================================================
+# TEST 27: Symlink target warnings on stderr
+# =========================================================
+blue "=== TEST 27: Symlink target warnings ==="
+
+init_project /tmp/earwig-test-27
+
+# Create a symlink with a relative target (should NOT warn)
+write_file "target.txt" "real content"
+ln -s target.txt link-relative
+snapshot                                        # snapshot #1
+
+restore_output=$(earwig restore "${SNAPSHOTS[0]}" 2>&1)
+if echo "$restore_output" | grep -q "potentially unsafe target"; then
+    fail "relative symlink should not warn" "got warning: $restore_output"
+else
+    pass "relative symlink does not warn"
+fi
+
+# Create a symlink with an absolute target (SHOULD warn)
+rm -f link-relative
+ln -s /tmp/absolute-target link-absolute
+snapshot                                        # snapshot #2
+
+warn_output=$(earwig restore "${SNAPSHOTS[1]}" 2>&1)
+if echo "$warn_output" | grep -q "potentially unsafe target"; then
+    pass "absolute symlink target triggers warning"
+else
+    fail "absolute symlink target triggers warning" "stderr: $warn_output"
+fi
+
+# Create a symlink with .. in target (SHOULD warn)
+rm -f link-absolute
+mkdir -p subdir
+ln -s ../outside link-dotdot
+snapshot                                        # snapshot #3
+
+warn_output2=$(earwig restore "${SNAPSHOTS[2]}" 2>&1)
+if echo "$warn_output2" | grep -q "potentially unsafe target"; then
+    pass "dotdot symlink target triggers warning"
+else
+    fail "dotdot symlink target triggers warning" "stderr: $warn_output2"
+fi
+
+# =========================================================
+# TEST 28: findRoot scope warning from deep subdirectory
+# =========================================================
+blue "=== TEST 28: findRoot scope warning ==="
+
+init_project /tmp/earwig-test-28
+
+write_file "top.txt" "top level"
+snapshot                                        # snapshot #1
+
+# Create a directory 4 levels deep and run earwig from there
+mkdir -p a/b/c/d
+cd a/b/c/d
+
+warn_output=$(earwig log 2>&1 1>/dev/null || true)
+if echo "$warn_output" | grep -q "warning.*levels above cwd"; then
+    pass "findRoot warns about deep subdirectory"
+else
+    fail "findRoot warns about deep subdirectory" "stderr: $warn_output"
+fi
+
+# Go back to project root
+cd /tmp/earwig-test-28
+
+# 2 levels deep should NOT warn
+mkdir -p x/y
+cd x/y
+warn_output2=$(earwig log 2>&1 1>/dev/null || true)
+if echo "$warn_output2" | grep -q "warning.*levels above cwd"; then
+    fail "2 levels should not warn" "got warning: $warn_output2"
+else
+    pass "2 levels deep does not warn"
+fi
+
+cd /tmp/earwig-test-28
+
+# =========================================================
+# TEST 29: Corrupt timestamp detection
+# =========================================================
+blue "=== TEST 29: Corrupt timestamp detection ==="
+
+init_project /tmp/earwig-test-29
+
+write_file "a.txt" "content"
+snapshot                                        # snapshot #1
+
+# Corrupt the created_at timestamp in the DB
+sqlite3 .earwig/earwig.db "UPDATE snapshots SET created_at = 'not-a-timestamp';"
+
+# earwig log should fail with a meaningful error about corrupt timestamp
+log_output=$(earwig log 2>&1 || true)
+if echo "$log_output" | grep -q "corrupt timestamp"; then
+    pass "corrupt timestamp detected by earwig log"
+else
+    fail "corrupt timestamp detected by earwig log" "output: $log_output"
+fi
 
 # =========================================================
 # DONE
