@@ -278,16 +278,23 @@ func (c *Creator) readSymlink(absPath, relPath string) (store.SnapshotFile, erro
 	}, nil
 }
 
+// fileKey captures the identity of a file for change detection.
+type fileKey struct {
+	BlobHash string
+	Type     string
+	Mode     uint32
+}
+
 func filesEqual(a []store.SnapshotFile, b []store.SnapshotFile) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	aMap := make(map[string]string, len(a))
+	aMap := make(map[string]fileKey, len(a))
 	for _, f := range a {
-		aMap[f.Path] = f.BlobHash
+		aMap[f.Path] = fileKey{f.BlobHash, f.Type, f.Mode}
 	}
 	for _, f := range b {
-		if aMap[f.Path] != f.BlobHash {
+		if aMap[f.Path] != (fileKey{f.BlobHash, f.Type, f.Mode}) {
 			return false
 		}
 	}

@@ -158,7 +158,9 @@ func cmdSnapshot(args []string) error {
 		return nil
 	}
 
-	writeHead(root, snap.ID)
+	if err := writeHead(root, snap.ID); err != nil {
+		return fmt.Errorf("writing HEAD: %w", err)
+	}
 	fmt.Printf("Snapshot %s\n", snap.Hash[:12])
 	return nil
 }
@@ -295,11 +297,15 @@ func readHead(root string, s *store.Store) (*int64, error) {
 	if err == nil {
 		idStr := strings.TrimSpace(string(data))
 		var id int64
-		if _, err := fmt.Sscanf(idStr, "%d", &id); err == nil {
-			return &id, nil
+		if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+			return nil, fmt.Errorf("corrupt HEAD file (content: %q): %w", idStr, err)
 		}
+		return &id, nil
 	}
-	// Fall back to latest snapshot
+	if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("reading HEAD: %w", err)
+	}
+	// No HEAD file — fall back to latest snapshot
 	latest, err := s.GetLatestSnapshot()
 	if err != nil {
 		return nil, err
@@ -310,9 +316,13 @@ func readHead(root string, s *store.Store) (*int64, error) {
 	return nil, nil
 }
 
-func writeHead(root string, id int64) {
+func writeHead(root string, id int64) error {
 	headPath := filepath.Join(root, ".earwig", "HEAD")
-	os.WriteFile(headPath, []byte(fmt.Sprintf("%d", id)), 0644)
+	tmpPath := fmt.Sprintf("%s.tmp.%d", headPath, os.Getpid())
+	if err := os.WriteFile(tmpPath, []byte(fmt.Sprintf("%d", id)), 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, headPath)
 }
 
 // Lock file: prevents watcher from snapshotting during restore
@@ -323,7 +333,33 @@ func lockPath(root string) string {
 
 func acquireLock(root string) error {
 	content := fmt.Sprintf("%d %d", os.Getpid(), time.Now().Unix())
-	return os.WriteFile(lockPath(root), []byte(content), 0644)
+	p := lockPath(root)
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		if !os.IsExist(err) {
+			return err
+		}
+		// File exists — check if stale
+		if isLocked(root) {
+			return fmt.Errorf("another earwig process holds the lock")
+		}
+		// Stale lock — remove and retry once
+		os.Remove(p)
+		f, err = os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		if err != nil {
+			return err
+		}
+	}
+	if _, err = f.WriteString(content); err != nil {
+		f.Close()
+		os.Remove(p)
+		return err
+	}
+	if err = f.Close(); err != nil {
+		os.Remove(p)
+		return err
+	}
+	return nil
 }
 
 func releaseLock(root string) {
@@ -331,9 +367,10 @@ func releaseLock(root string) {
 }
 
 // isLocked returns true if a live restore process holds the lock.
-// Removes stale locks from dead processes.
+// Removes stale locks from dead processes or locks older than 5 minutes.
 func isLocked(root string) bool {
-	data, err := os.ReadFile(lockPath(root))
+	p := lockPath(root)
+	data, err := os.ReadFile(p)
 	if err != nil {
 		return false
 	}
@@ -345,15 +382,26 @@ func isLocked(root string) bool {
 	if err != nil {
 		return false
 	}
+
+	// Age-based staleness: locks older than 5 minutes are stale
+	if len(parts) >= 2 {
+		if ts, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+			if time.Since(time.Unix(ts, 0)) > 5*time.Minute {
+				os.Remove(p)
+				return false
+			}
+		}
+	}
+
 	// Check if process is still alive
 	proc, err := os.FindProcess(pid)
 	if err != nil {
-		os.Remove(lockPath(root))
+		os.Remove(p)
 		return false
 	}
 	// On Unix, FindProcess always succeeds. Signal 0 checks if process exists.
 	if err := proc.Signal(syscall.Signal(0)); err != nil {
-		os.Remove(lockPath(root))
+		os.Remove(p)
 		return false
 	}
 	return true
@@ -398,6 +446,18 @@ func cmdWatch(args []string) error {
 		changedPaths = make(map[string]bool)
 		mu.Unlock()
 
+		// Re-check lock after swap — a restore may have started between
+		// the first check and now.
+		if isLocked(root) {
+			// Put paths back so they're picked up on the next cycle
+			mu.Lock()
+			for p := range paths {
+				changedPaths[p] = true
+			}
+			mu.Unlock()
+			return
+		}
+
 		// Every 10th snapshot or if no parent, do a full walk for consistency
 		snapCount++
 		if parentID == nil || snapCount%10 == 0 || len(paths) == 0 {
@@ -413,7 +473,10 @@ func cmdWatch(args []string) error {
 			return // No changes
 		}
 
-		writeHead(root, snap.ID)
+		if err := writeHead(root, snap.ID); err != nil {
+			log.Printf("error writing HEAD: %v", err)
+			return
+		}
 		fmt.Printf("[%s] Snapshot %s\n", snap.CreatedAt.Format("15:04:05"), snap.Hash[:12])
 	}
 
@@ -479,7 +542,9 @@ func cmdRestore(args []string) error {
 		return fmt.Errorf("pre-restore snapshot: %w", err)
 	}
 	if preSnap != nil {
-		writeHead(root, preSnap.ID)
+		if err := writeHead(root, preSnap.ID); err != nil {
+			return fmt.Errorf("writing HEAD: %w", err)
+		}
 		fmt.Printf("Saved current state as %s\n", preSnap.Hash[:12])
 	}
 
@@ -488,7 +553,9 @@ func cmdRestore(args []string) error {
 		return err
 	}
 
-	writeHead(root, snap.ID)
+	if err := writeHead(root, snap.ID); err != nil {
+		return fmt.Errorf("writing HEAD: %w", err)
+	}
 	fmt.Printf("Restored to snapshot %s (%s)\n", snap.Hash[:12], snap.CreatedAt.Format("2006-01-02 15:04:05"))
 	return nil
 }

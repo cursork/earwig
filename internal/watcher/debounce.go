@@ -28,10 +28,10 @@ func (d *Debouncer) Trigger(callback func()) {
 
 	d.pending = true
 	d.timer = time.AfterFunc(d.interval, func() {
+		callback()
 		d.mu.Lock()
 		d.pending = false
 		d.mu.Unlock()
-		callback()
 	})
 }
 

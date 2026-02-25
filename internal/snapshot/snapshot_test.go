@@ -557,3 +557,148 @@ func TestSymlinkRoundTrip(t *testing.T) {
 		t.Fatalf("link.txt target: got %q, want %q", got, target)
 	}
 }
+
+func TestFilesEqualTypeChange(t *testing.T) {
+	// Same content/path but different type should not be equal
+	h := "abc123"
+	a := []store.SnapshotFile{{Path: "link.txt", BlobHash: h, Mode: 0644, Type: "file"}}
+	b := []store.SnapshotFile{{Path: "link.txt", BlobHash: h, Mode: 0644, Type: "symlink"}}
+	if filesEqual(a, b) {
+		t.Fatal("filesEqual should return false when type differs")
+	}
+}
+
+func TestFilesEqualModeChange(t *testing.T) {
+	// Same content/path/type but different mode should not be equal
+	h := "abc123"
+	a := []store.SnapshotFile{{Path: "exec.sh", BlobHash: h, Mode: 0644, Type: "file"}}
+	b := []store.SnapshotFile{{Path: "exec.sh", BlobHash: h, Mode: 0755, Type: "file"}}
+	if filesEqual(a, b) {
+		t.Fatal("filesEqual should return false when mode differs")
+	}
+}
+
+func TestRestoreRegularFileToSymlink(t *testing.T) {
+	s, dir := setup(t)
+
+	// Snapshot 1: regular file
+	writeFile(t, dir, "target.txt", "regular content")
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap1, err := c.TakeSnapshot(nil, "as-file")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot 2: symlink at the same path
+	os.Remove(filepath.Join(dir, "target.txt"))
+	linkTarget := filepath.Join(t.TempDir(), "elsewhere")
+	os.WriteFile(linkTarget, []byte("external"), 0644)
+	os.Symlink(linkTarget, filepath.Join(dir, "target.txt"))
+
+	snap2, err := c.TakeSnapshot(&snap1.ID, "as-symlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Restore snap1 (regular file) then snap2 (symlink)
+	restorer := NewRestorer(s, dir, ig)
+	if err := restorer.Restore(snap1.ID); err != nil {
+		t.Fatalf("Restore to snap1: %v", err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "target.txt"))
+	if string(data) != "regular content" {
+		t.Fatalf("expected regular content, got %q", data)
+	}
+
+	// Now restore to symlink — this is the critical test.
+	// The regular file must be removed before os.Symlink.
+	if err := restorer.Restore(snap2.ID); err != nil {
+		t.Fatalf("Restore to snap2 (file->symlink): %v", err)
+	}
+	info, err := os.Lstat(filepath.Join(dir, "target.txt"))
+	if err != nil {
+		t.Fatalf("target.txt missing: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("target.txt should be a symlink after restore")
+	}
+	got, _ := os.Readlink(filepath.Join(dir, "target.txt"))
+	if got != linkTarget {
+		t.Fatalf("symlink target: got %q, want %q", got, linkTarget)
+	}
+}
+
+func TestRestoreOverwritesReadOnlyFile(t *testing.T) {
+	s, dir := setup(t)
+
+	writeFile(t, dir, "ro.txt", "version1")
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap1, err := c.TakeSnapshot(nil, "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write new content and make it read-only
+	writeFile(t, dir, "ro.txt", "version2")
+	os.Chmod(filepath.Join(dir, "ro.txt"), 0444)
+
+	snap2, err := c.TakeSnapshot(&snap1.ID, "v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = snap2
+
+	// Restore to snap1 — must overwrite the read-only file
+	restorer := NewRestorer(s, dir, ig)
+	if err := restorer.Restore(snap1.ID); err != nil {
+		t.Fatalf("Restore over read-only file: %v", err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "ro.txt"))
+	if string(data) != "version1" {
+		t.Fatalf("expected 'version1', got %q", data)
+	}
+}
+
+func TestRestoreSkipsIgnoredPaths(t *testing.T) {
+	s, dir := setup(t)
+
+	writeFile(t, dir, "a.txt", "tracked")
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap, err := c.TakeSnapshot(nil, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Manually insert a malicious snapshot with a .earwig/ path
+	blobHash, _ := s.PutBlob([]byte("malicious"))
+	malSnap, err := s.CreateSnapshot(&snap.ID, []store.SnapshotFile{
+		{Path: "a.txt", BlobHash: blobHash, Mode: 0644, Size: 9, Type: "file"},
+		{Path: ".earwig/evil.txt", BlobHash: blobHash, Mode: 0644, Size: 9, Type: "file"},
+	}, "malicious")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restorer := NewRestorer(s, dir, ig)
+	if err := restorer.Restore(malSnap.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// .earwig/evil.txt must NOT have been written
+	evilPath := filepath.Join(dir, ".earwig", "evil.txt")
+	if _, err := os.Stat(evilPath); err == nil {
+		t.Fatal(".earwig/evil.txt should not exist — ignore matcher bypass")
+	}
+
+	// a.txt should be restored normally
+	data, _ := os.ReadFile(filepath.Join(dir, "a.txt"))
+	if string(data) != "malicious" {
+		t.Fatalf("a.txt expected 'malicious', got %q", data)
+	}
+}

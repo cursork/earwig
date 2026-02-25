@@ -4,16 +4,21 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	_ "modernc.org/sqlite"
 )
 
+
 type Store struct {
-	db *sql.DB
+	db      *sql.DB
+	zstdEnc *zstd.Encoder
+	zstdDec *zstd.Decoder
 }
 
 func Open(dbPath string) (*Store, error) {
@@ -26,24 +31,58 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("pinging database: %w", err)
 	}
-	s := &Store{db: db}
+
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating zstd encoder: %w", err)
+	}
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		db.Close()
+		enc.Close()
+		return nil, fmt.Errorf("creating zstd decoder: %w", err)
+	}
+
+	s := &Store{db: db, zstdEnc: enc, zstdDec: dec}
 	if err := s.migrate(); err != nil {
 		db.Close()
+		enc.Close()
+		dec.Close()
 		return nil, fmt.Errorf("migrating database: %w", err)
 	}
 	return s, nil
 }
 
 func (s *Store) Close() error {
-	return s.db.Close()
+	var errs []error
+	if err := s.zstdEnc.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("closing zstd encoder: %w", err))
+	}
+	s.zstdDec.Close()
+	if err := s.db.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("closing database: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Store) PutBlob(data []byte) (string, error) {
 	h := sha256.Sum256(data)
 	hash := hex.EncodeToString(h[:])
+
+	stored := data
+	encoding := "raw"
+	if len(data) >= 128*1024 {
+		compressed := s.zstdEnc.EncodeAll(data, make([]byte, 0, len(data)/2))
+		if len(compressed) < len(data) {
+			stored = compressed
+			encoding = "zstd"
+		}
+	}
+
 	_, err := s.db.Exec(
-		`INSERT OR IGNORE INTO blobs (hash, size, data) VALUES (?, ?, ?)`,
-		hash, len(data), data,
+		`INSERT OR IGNORE INTO blobs (hash, size, data, encoding) VALUES (?, ?, ?, ?)`,
+		hash, len(data), stored, encoding,
 	)
 	if err != nil {
 		return "", fmt.Errorf("storing blob: %w", err)
@@ -53,9 +92,16 @@ func (s *Store) PutBlob(data []byte) (string, error) {
 
 func (s *Store) GetBlob(hash string) ([]byte, error) {
 	var data []byte
-	err := s.db.QueryRow(`SELECT data FROM blobs WHERE hash = ?`, hash).Scan(&data)
+	var encoding string
+	err := s.db.QueryRow(`SELECT data, encoding FROM blobs WHERE hash = ?`, hash).Scan(&data, &encoding)
 	if err != nil {
 		return nil, fmt.Errorf("getting blob %s: %w", hash, err)
+	}
+	if encoding == "zstd" {
+		data, err = s.zstdDec.DecodeAll(data, nil)
+		if err != nil {
+			return nil, fmt.Errorf("decompressing blob %s: %w", hash, err)
+		}
 	}
 	return data, nil
 }
@@ -144,9 +190,11 @@ func (s *Store) CreateSnapshot(parentID *int64, files []SnapshotFile, message st
 }
 
 func (s *Store) GetSnapshot(hashPrefix string) (*Snapshot, error) {
+	// Escape LIKE wildcards so user-provided prefixes are treated literally
+	escaped := strings.NewReplacer("%", "\\%", "_", "\\_").Replace(hashPrefix)
 	rows, err := s.db.Query(
-		`SELECT id, hash, parent_id, created_at, message FROM snapshots WHERE hash LIKE ? LIMIT 2`,
-		hashPrefix+"%",
+		`SELECT id, hash, parent_id, created_at, message FROM snapshots WHERE hash LIKE ? ESCAPE '\' LIMIT 2`,
+		escaped+"%",
 	)
 	if err != nil {
 		return nil, err
@@ -166,6 +214,9 @@ func (s *Store) GetSnapshot(hashPrefix string) (*Snapshot, error) {
 		}
 		snap.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 		results = append(results, snap)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	if len(results) == 0 {
@@ -198,6 +249,9 @@ func (s *Store) GetSnapshotFiles(snapshotID int64) ([]SnapshotFile, error) {
 		f.ModTime, _ = time.Parse(time.RFC3339, modTime)
 		files = append(files, f)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return files, nil
 }
 
@@ -223,6 +277,9 @@ func (s *Store) ListSnapshots() ([]Snapshot, error) {
 		}
 		snap.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 		snapshots = append(snapshots, snap)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return snapshots, nil
 }
@@ -273,7 +330,7 @@ func (s *Store) DiffSnapshots(oldID, newID int64) ([]FileChange, error) {
 		of, exists := oldMap[path]
 		if !exists {
 			changes = append(changes, FileChange{Path: path, Type: ChangeAdded, NewHash: nf.BlobHash})
-		} else if of.BlobHash != nf.BlobHash {
+		} else if of.BlobHash != nf.BlobHash || of.Type != nf.Type || of.Mode != nf.Mode {
 			changes = append(changes, FileChange{Path: path, Type: ChangeModified, OldHash: of.BlobHash, NewHash: nf.BlobHash})
 		}
 	}

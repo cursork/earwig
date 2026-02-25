@@ -36,7 +36,7 @@ func (r *Restorer) Restore(snapshotID int64) error {
 
 	// Walk current filesystem to find existing tracked files
 	var existingPaths []string
-	filepath.WalkDir(r.rootDir, func(path string, d os.DirEntry, err error) error {
+	if err := filepath.WalkDir(r.rootDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -55,7 +55,9 @@ func (r *Restorer) Restore(snapshotID int64) error {
 			existingPaths = append(existingPaths, relPath)
 		}
 		return nil
-	})
+	}); err != nil {
+		return fmt.Errorf("walking filesystem: %w", err)
+	}
 
 	// Delete files not in target snapshot
 	for _, path := range existingPaths {
@@ -64,7 +66,9 @@ func (r *Restorer) Restore(snapshotID int64) error {
 			if err != nil {
 				continue // skip paths that escape root
 			}
-			os.Remove(absPath)
+			if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("removing %s: %w", path, err)
+			}
 		}
 	}
 
@@ -76,24 +80,45 @@ func (r *Restorer) Restore(snapshotID int64) error {
 
 	// Write files from target snapshot, skipping files that already match
 	for _, f := range targetFiles {
+		// Never restore into ignored directories (e.g. .earwig/)
+		if r.ignore.Match(f.Path) {
+			continue
+		}
+
 		absPath, err := safePath(r.rootDir, f.Path)
 		if err != nil {
 			return fmt.Errorf("unsafe path in snapshot: %w", err)
 		}
 
-		// Remove anything at this path that doesn't match the target type.
-		// Symlinks are always removed first to prevent following them.
+		// Remove anything at this path that conflicts with the target type.
+		// Symlinks are always removed to prevent following them.
+		// Regular files are removed when target is a symlink (os.Symlink
+		// won't overwrite) or when they are read-only (os.WriteFile can't
+		// open for writing).
 		if info, err := os.Lstat(absPath); err == nil {
 			isLink := info.Mode()&os.ModeSymlink != 0
-			if isLink {
-				os.Remove(absPath)
+			needsRemove := isLink ||
+				f.Type == "symlink" ||
+				(!info.Mode().IsDir() && info.Mode().Perm()&0200 == 0)
+			if needsRemove {
+				if err := os.Remove(absPath); err != nil {
+					return fmt.Errorf("removing %s: %w", f.Path, err)
+				}
 			}
 		}
 
 		// If file exists on disk, check if it already matches the target
-		if existingSet[f.Path] {
+		if existingSet[f.Path] && f.Type != "symlink" {
 			if h, err := hashFile(absPath); err == nil && h == f.BlobHash {
-				continue // Already matches, skip
+				// Content matches — but still fix permissions if they differ
+				if info, err := os.Lstat(absPath); err == nil {
+					if info.Mode().Perm() != os.FileMode(f.Mode).Perm() {
+						if err := os.Chmod(absPath, os.FileMode(f.Mode).Perm()); err != nil {
+							return fmt.Errorf("fixing permissions on %s: %w", f.Path, err)
+						}
+					}
+				}
+				continue
 			}
 		}
 
@@ -103,22 +128,35 @@ func (r *Restorer) Restore(snapshotID int64) error {
 			return err
 		}
 
-		os.MkdirAll(filepath.Dir(absPath), 0755)
+		if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+			return fmt.Errorf("creating directory for %s: %w", f.Path, err)
+		}
 
 		data, err := r.store.GetBlob(f.BlobHash)
 		if err != nil {
 			return err
 		}
 
-		if f.Type == "symlink" {
+		// Mask mode to permission bits only (strip setuid/setgid/sticky
+		// that a crafted DB could set).
+		mode := os.FileMode(f.Mode).Perm()
+
+		switch f.Type {
+		case "symlink":
 			// Blob content is the symlink target path
 			if err := os.Symlink(string(data), absPath); err != nil {
 				return err
 			}
-		} else {
-			if err := os.WriteFile(absPath, data, os.FileMode(f.Mode)); err != nil {
+		case "file", "":
+			if err := os.WriteFile(absPath, data, mode); err != nil {
 				return err
 			}
+			// WriteFile is subject to umask; explicitly set the stored mode.
+			if err := os.Chmod(absPath, mode); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unknown file type %q for %s", f.Type, f.Path)
 		}
 	}
 
@@ -161,14 +199,6 @@ func removeSymlinksInPath(rootDir, targetDir string) error {
 	rel, err := filepath.Rel(rootDir, targetDir)
 	if err != nil {
 		return nil
-	}
-	parts := filepath.SplitList(rel)
-	if len(parts) == 0 {
-		// SplitList is for PATH-style lists; use manual split
-		parts = nil
-		for _, p := range splitPath(rel) {
-			parts = append(parts, p)
-		}
 	}
 	current := rootDir
 	for _, part := range splitPath(rel) {

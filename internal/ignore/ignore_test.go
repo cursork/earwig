@@ -35,7 +35,9 @@ func TestBuiltinIgnores(t *testing.T) {
 func TestCustomPatterns(t *testing.T) {
 	dir := t.TempDir()
 	ignoreFile := filepath.Join(dir, "ignore")
-	os.WriteFile(ignoreFile, []byte("*.log\nbuild/\n"), 0644)
+	if err := os.WriteFile(ignoreFile, []byte("*.log\nbuild/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	m, err := New([]string{ignoreFile})
 	if err != nil {
@@ -64,10 +66,14 @@ func TestMultipleIgnoreFiles(t *testing.T) {
 	dir := t.TempDir()
 
 	file1 := filepath.Join(dir, "a")
-	os.WriteFile(file1, []byte("*.log\n"), 0644)
+	if err := os.WriteFile(file1, []byte("*.log\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	file2 := filepath.Join(dir, "b")
-	os.WriteFile(file2, []byte("*.tmp\n"), 0644)
+	if err := os.WriteFile(file2, []byte("*.tmp\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	m, err := New([]string{file1, file2})
 	if err != nil {
@@ -103,7 +109,9 @@ func TestMissingIgnoreFile(t *testing.T) {
 func TestNegationPattern(t *testing.T) {
 	dir := t.TempDir()
 	ignoreFile := filepath.Join(dir, "ignore")
-	os.WriteFile(ignoreFile, []byte("*.log\n!important.log\n"), 0644)
+	if err := os.WriteFile(ignoreFile, []byte("*.log\n!important.log\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	m, err := New([]string{ignoreFile})
 	if err != nil {

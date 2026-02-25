@@ -7,9 +7,10 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 CREATE TABLE IF NOT EXISTS blobs (
-    hash TEXT PRIMARY KEY,
-    size INTEGER NOT NULL,
-    data BLOB NOT NULL
+    hash     TEXT PRIMARY KEY,
+    size     INTEGER NOT NULL,
+    data     BLOB NOT NULL,
+    encoding TEXT NOT NULL DEFAULT 'raw'
 );
 
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -46,18 +47,39 @@ func (s *Store) migrate() error {
 	err = s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema_version'`).Scan(&version)
 	if err != nil {
 		// First run — set version
-		_, err = s.db.Exec(`INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '2')`)
+		_, err = s.db.Exec(`INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '3')`)
 		return err
 	}
 
 	if version == "1" {
 		// v1 -> v2: add type column to snapshot_files
-		_, err = s.db.Exec(`ALTER TABLE snapshot_files ADD COLUMN type TEXT NOT NULL DEFAULT 'file'`)
-		if err != nil {
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('snapshot_files') WHERE name='type'`).Scan(&count); err != nil {
 			return err
 		}
-		_, err = s.db.Exec(`UPDATE meta SET value = '2' WHERE key = 'schema_version'`)
-		if err != nil {
+		if count == 0 {
+			if _, err = s.db.Exec(`ALTER TABLE snapshot_files ADD COLUMN type TEXT NOT NULL DEFAULT 'file'`); err != nil {
+				return err
+			}
+		}
+		version = "2"
+		if _, err = s.db.Exec(`UPDATE meta SET value = '2' WHERE key = 'schema_version'`); err != nil {
+			return err
+		}
+	}
+
+	if version == "2" {
+		// v2 -> v3: add encoding column to blobs
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('blobs') WHERE name='encoding'`).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			if _, err = s.db.Exec(`ALTER TABLE blobs ADD COLUMN encoding TEXT NOT NULL DEFAULT 'raw'`); err != nil {
+				return err
+			}
+		}
+		if _, err = s.db.Exec(`UPDATE meta SET value = '3' WHERE key = 'schema_version'`); err != nil {
 			return err
 		}
 	}

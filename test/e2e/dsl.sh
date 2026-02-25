@@ -110,8 +110,8 @@ expect_file() {
 
 expect_no_file() {
     local path="$1"
-    if [ -f "$path" ]; then
-        fail "$path should not exist" "file exists with content: $(cat "$path")"
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        fail "$path should not exist" "file or symlink exists"
     else
         pass "$path does not exist"
     fi
@@ -180,6 +180,62 @@ expect_no_changes() {
     fi
 }
 
+# ── expect: file properties ────────────────────────────
+
+expect_file_mode() {
+    local path="$1" expected="$2"
+    if [ ! -e "$path" ]; then
+        fail "$path mode == $expected" "file not found"
+        return
+    fi
+    local actual
+    actual=$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null)
+    if [ "$actual" = "$expected" ]; then
+        pass "$path mode == $expected"
+    else
+        fail "$path mode == $expected" "got $actual"
+    fi
+}
+
+expect_is_symlink() {
+    local path="$1"
+    if [ -L "$path" ]; then
+        pass "$path is a symlink"
+    else
+        fail "$path is a symlink" "not a symlink"
+    fi
+}
+
+expect_symlink_target() {
+    local path="$1" expected="$2"
+    if [ ! -L "$path" ]; then
+        fail "$path -> $expected" "not a symlink"
+        return
+    fi
+    local actual
+    actual=$(readlink "$path")
+    if [ "$actual" = "$expected" ]; then
+        pass "$path -> $expected"
+    else
+        fail "$path -> $expected" "got $actual"
+    fi
+}
+
+expect_file_size() {
+    local path="$1" expected="$2"
+    if [ ! -f "$path" ]; then
+        fail "$path size == $expected" "file not found"
+        return
+    fi
+    local actual
+    actual=$(wc -c < "$path" | tr -d ' ')
+    if [ "$actual" = "$expected" ]; then
+        pass "$path size == $expected bytes"
+    else
+        fail "$path size == $expected bytes" "got $actual"
+    fi
+}
+
 # ── summary ─────────────────────────────────────────────
 
 summary() {
@@ -191,5 +247,5 @@ summary() {
         red "FAILED: $FAIL failures, $PASS passed"
     fi
     echo "================================"
-    exit "$FAIL"
+    exit $(( FAIL > 0 ? 1 : 0 ))
 }
