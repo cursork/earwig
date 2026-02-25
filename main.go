@@ -490,6 +490,7 @@ func cmdWatch(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer w.Close()
 
 	w.OnEvent = func(relPath string) {
 		mu.Lock()

@@ -781,6 +781,77 @@ else
 fi
 
 # =========================================================
+# TEST 22: Regular file → symlink restore transition
+# =========================================================
+blue "=== TEST 22: File to symlink restore ==="
+
+init_project /tmp/earwig-test-22
+
+# Snapshot 1: regular file
+write_file "target.txt" "regular content"
+snapshot                                        # snapshot #1
+
+# Snapshot 2: replace file with symlink
+rm -f "target.txt"
+ln -s "/tmp/earwig-test-22-external" "target.txt"
+mkdir -p /tmp/earwig-test-22-external 2>/dev/null || true
+snapshot                                        # snapshot #2
+
+# Restore to #1 (symlink → regular file)
+restore 1
+expect_file "target.txt" "regular content"
+if [ -L "target.txt" ]; then
+    fail "target.txt should be a regular file after restore" "still a symlink"
+else
+    pass "target.txt is a regular file after restore to #1"
+fi
+
+# Restore to #2 (regular file → symlink)
+restore 2
+expect_is_symlink "target.txt"
+expect_symlink_target "target.txt" "/tmp/earwig-test-22-external"
+
+# Restore back to #1 again (symlink → regular file, round trip)
+restore 1
+expect_file "target.txt" "regular content"
+if [ -L "target.txt" ]; then
+    fail "target.txt should be regular on second restore" "still a symlink"
+else
+    pass "target.txt regular file round-trip works"
+fi
+
+rm -rf /tmp/earwig-test-22-external
+
+# =========================================================
+# TEST 23: Restore over read-only files
+# =========================================================
+blue "=== TEST 23: Restore over read-only files ==="
+
+init_project /tmp/earwig-test-23
+
+write_file "ro.txt" "version1"
+write_file "ro-dir/inside.txt" "inside-v1"
+snapshot                                        # snapshot #1
+
+# Modify content and make files/dir read-only
+write_file "ro.txt" "version2"
+chmod 444 "ro.txt"
+write_file "ro-dir/inside.txt" "inside-v2"
+chmod 555 "ro-dir"
+snapshot                                        # snapshot #2
+
+# Restore to #1 — must overwrite the read-only file and file in read-only dir
+restore 1
+expect_file "ro.txt" "version1"
+expect_file "ro-dir/inside.txt" "inside-v1"
+expect_file_mode "ro.txt" "644"
+
+# Restore to #2 — verify read-only modes are restored
+restore 2
+expect_file "ro.txt" "version2"
+expect_file_mode "ro.txt" "444"
+
+# =========================================================
 # DONE
 # =========================================================
 summary

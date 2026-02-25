@@ -663,6 +663,50 @@ func TestRestoreOverwritesReadOnlyFile(t *testing.T) {
 	}
 }
 
+func TestRestoreDeletesFileInReadOnlyDir(t *testing.T) {
+	s, dir := setup(t)
+
+	writeFile(t, dir, "ro-dir/keep.txt", "keep")
+	writeFile(t, dir, "ro-dir/delete-me.txt", "gone")
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap1, err := c.TakeSnapshot(nil, "with-both")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Remove the file from disk and take a new snapshot
+	os.Remove(filepath.Join(dir, "ro-dir", "delete-me.txt"))
+	snap2, err := c.TakeSnapshot(&snap1.ID, "without-delete-me")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Restore to snap1 (both files), then make dir read-only
+	restorer := NewRestorer(s, dir, ig)
+	if err := restorer.Restore(snap1.ID); err != nil {
+		t.Fatalf("Restore to snap1: %v", err)
+	}
+	os.Chmod(filepath.Join(dir, "ro-dir"), 0555)
+	t.Cleanup(func() {
+		// Ensure cleanup can remove the dir
+		os.Chmod(filepath.Join(dir, "ro-dir"), 0755)
+	})
+
+	// Restore to snap2 — must delete delete-me.txt from read-only dir
+	if err := restorer.Restore(snap2.ID); err != nil {
+		t.Fatalf("Restore with read-only parent dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ro-dir", "delete-me.txt")); err == nil {
+		t.Fatal("delete-me.txt should have been removed from read-only dir")
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "ro-dir", "keep.txt"))
+	if string(data) != "keep" {
+		t.Fatalf("keep.txt expected 'keep', got %q", data)
+	}
+}
+
 func TestRestoreSkipsIgnoredPaths(t *testing.T) {
 	s, dir := setup(t)
 

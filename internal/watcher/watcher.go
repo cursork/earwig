@@ -29,6 +29,12 @@ func New(root string, ig *ignore.Matcher) (*Watcher, error) {
 	}, nil
 }
 
+// Close releases the underlying fsnotify watcher resources.
+// Safe to call if Run has not been started or has already returned.
+func (w *Watcher) Close() error {
+	return w.fsw.Close()
+}
+
 func (w *Watcher) addRecursive(dir string) error {
 	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -73,9 +79,10 @@ func (w *Watcher) Run(ctx context.Context) error {
 				continue
 			}
 
-			// If a new directory was created, watch it recursively
+			// If a new directory was created, watch it recursively.
+			// Use Lstat to avoid following symlinks into external dirs.
 			if event.Has(fsnotify.Create) {
-				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+				if info, err := os.Lstat(event.Name); err == nil && info.IsDir() {
 					w.addRecursive(event.Name)
 				}
 			}

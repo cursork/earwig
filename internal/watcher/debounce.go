@@ -5,8 +5,8 @@ import (
 	"time"
 )
 
-// Debouncer implements leading-edge debounce: the first event starts a timer,
-// subsequent events are ignored until the timer fires.
+// Debouncer implements non-overlapping trailing-edge debounce: the first event
+// starts a timer; subsequent events are ignored until the callback completes.
 type Debouncer struct {
 	interval time.Duration
 	mu       sync.Mutex
