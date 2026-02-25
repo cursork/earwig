@@ -155,6 +155,14 @@ func (s *Store) CreateSnapshot(parentID *int64, files []SnapshotFile, message st
 		b.WriteString(f.Path)
 		b.WriteByte(':')
 		b.WriteString(f.BlobHash)
+		b.WriteByte(':')
+		fileType := f.Type
+		if fileType == "" {
+			fileType = "file"
+		}
+		b.WriteString(fileType)
+		b.WriteByte(':')
+		fmt.Fprintf(&b, "%o", f.Mode)
 		b.WriteByte('\n')
 	}
 	h := sha256.Sum256([]byte(b.String()))

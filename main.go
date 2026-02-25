@@ -144,7 +144,7 @@ func cmdInit(args []string) error {
 		return fmt.Errorf("earwig already initialized in %s", cwd)
 	}
 
-	if err := os.MkdirAll(earwigDir, 0755); err != nil {
+	if err := os.MkdirAll(earwigDir, 0700); err != nil {
 		return err
 	}
 
