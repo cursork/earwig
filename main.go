@@ -28,6 +28,7 @@ var commands = map[string]func([]string) error{
 	"watch":    cmdWatch,
 	"restore":  cmdRestore,
 	"gc":       cmdGC,
+	"forget":   cmdForget,
 	"_files":   cmdFiles,
 }
 
@@ -547,12 +548,65 @@ func cmdRestore(args []string) error {
 	return nil
 }
 
-func cmdGC(args []string) error {
-	s, _, err := openStore()
+func cmdForget(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: earwig forget <hash>")
+	}
+
+	s, root, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer s.Close()
+
+	flockFile, err := acquireFlock(root, true)
+	if err != nil {
+		return fmt.Errorf("acquiring lock: %w", err)
+	}
+	defer flockFile.Close()
+
+	snap, err := s.GetSnapshot(args[0])
+	if err != nil {
+		return err
+	}
+
+	// Don't allow forgetting the current HEAD snapshot.
+	headID, err := readHead(root, s)
+	if err != nil {
+		return err
+	}
+	if headID != nil && *headID == snap.ID {
+		return fmt.Errorf("cannot forget the current HEAD snapshot")
+	}
+
+	if err := s.DeleteSnapshot(snap.ID); err != nil {
+		return err
+	}
+	fmt.Printf("Forgot snapshot %s\n", shortHash(snap.Hash))
+
+	// Run GC to clean up any blobs orphaned by this deletion.
+	count, err := s.GarbageCollect()
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		fmt.Printf("Removed %d orphaned blob(s).\n", count)
+	}
+	return nil
+}
+
+func cmdGC(args []string) error {
+	s, root, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	flockFile, err := acquireFlock(root, true)
+	if err != nil {
+		return fmt.Errorf("acquiring lock: %w", err)
+	}
+	defer flockFile.Close()
 
 	count, err := s.GarbageCollect()
 	if err != nil {

@@ -68,12 +68,17 @@ func (r *Restorer) Restore(snapshotID int64) error {
 				continue // skip paths that escape root
 			}
 			if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
-				// If parent dir is read-only, make it writable and retry
+				// If parent dir is read-only, make it writable, retry, then restore.
 				if os.IsPermission(err) {
 					dir := filepath.Dir(absPath)
-					if chErr := os.Chmod(dir, 0755); chErr == nil {
-						if err2 := os.Remove(absPath); err2 == nil || os.IsNotExist(err2) {
-							continue
+					if dirInfo, stErr := os.Lstat(dir); stErr == nil {
+						origMode := dirInfo.Mode().Perm()
+						if chErr := os.Chmod(dir, 0755); chErr == nil {
+							err2 := os.Remove(absPath)
+							os.Chmod(dir, origMode)
+							if err2 == nil || os.IsNotExist(err2) {
+								continue
+							}
 						}
 					}
 				}

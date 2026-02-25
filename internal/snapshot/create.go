@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -238,15 +239,25 @@ func (c *Creator) TakeIncrementalSnapshot(parentID int64, changedPaths map[strin
 
 // readFile reads a regular file, stores its blob, and returns a SnapshotFile.
 func (c *Creator) readFile(absPath, relPath string) (store.SnapshotFile, error) {
-	info, err := os.Stat(absPath)
+	// Open first, then Fstat on the fd — no TOCTOU race between stat and read.
+	f, err := os.Open(absPath)
 	if err != nil {
 		return store.SnapshotFile{}, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return store.SnapshotFile{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return store.SnapshotFile{}, fmt.Errorf("not a regular file: %s", relPath)
 	}
 	if maxFileSize >= 0 && info.Size() > maxFileSize {
 		return store.SnapshotFile{}, fmt.Errorf("file too large: %s (%.1f MB)", relPath, float64(info.Size())/(1024*1024))
 	}
 
-	data, err := os.ReadFile(absPath)
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return store.SnapshotFile{}, err
 	}

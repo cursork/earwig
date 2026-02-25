@@ -363,6 +363,42 @@ func (s *Store) GetLatestSnapshot() (*Snapshot, error) {
 	return &snap, nil
 }
 
+// DeleteSnapshot removes a snapshot and its file entries.
+// Child snapshots that reference this one as parent are re-parented to this
+// snapshot's parent (or NULL if this was a root snapshot).
+func (s *Store) DeleteSnapshot(id int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Get this snapshot's parent so we can re-parent children.
+	var parentID sql.NullInt64
+	if err := tx.QueryRow(`SELECT parent_id FROM snapshots WHERE id = ?`, id).Scan(&parentID); err != nil {
+		return fmt.Errorf("snapshot %d not found: %w", id, err)
+	}
+
+	// Re-parent children to this snapshot's parent.
+	if parentID.Valid {
+		_, err = tx.Exec(`UPDATE snapshots SET parent_id = ? WHERE parent_id = ?`, parentID.Int64, id)
+	} else {
+		_, err = tx.Exec(`UPDATE snapshots SET parent_id = NULL WHERE parent_id = ?`, id)
+	}
+	if err != nil {
+		return fmt.Errorf("re-parenting children: %w", err)
+	}
+
+	if _, err := tx.Exec(`DELETE FROM snapshot_files WHERE snapshot_id = ?`, id); err != nil {
+		return fmt.Errorf("deleting snapshot files: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM snapshots WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("deleting snapshot: %w", err)
+	}
+
+	return tx.Commit()
+}
+
 // GarbageCollect removes blobs not referenced by any snapshot_files row.
 // Returns the number of orphaned blobs deleted.
 func (s *Store) GarbageCollect() (int64, error) {
