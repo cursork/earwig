@@ -810,6 +810,118 @@ func TestRestorePreservesReadOnlyDirPerms(t *testing.T) {
 	}
 }
 
+func TestPreviewCategorizesChanges(t *testing.T) {
+	s, dir := setup(t)
+
+	// Create initial state: a.txt, b.txt, c.txt
+	writeFile(t, dir, "a.txt", "original-a")
+	writeFile(t, dir, "b.txt", "original-b")
+	writeFile(t, dir, "c.txt", "original-c")
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap1, err := c.TakeSnapshot(nil, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Modify filesystem: change a.txt, delete b.txt, add d.txt
+	writeFile(t, dir, "a.txt", "changed-a")
+	os.Remove(filepath.Join(dir, "b.txt"))
+	writeFile(t, dir, "d.txt", "new-d")
+
+	// Preview restoring to snap1
+	restorer := NewRestorer(s, dir, ig)
+	plan, err := restorer.Preview(snap1.ID)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+
+	// d.txt should be in Delete (on disk but not in snapshot)
+	if len(plan.Delete) != 1 || plan.Delete[0] != "d.txt" {
+		t.Fatalf("expected Delete=[d.txt], got %v", plan.Delete)
+	}
+	// b.txt should be in Write (in snapshot but not on disk)
+	if len(plan.Write) != 1 || plan.Write[0] != "b.txt" {
+		t.Fatalf("expected Write=[b.txt], got %v", plan.Write)
+	}
+	// a.txt should be in Modify (different content)
+	if len(plan.Modify) != 1 || plan.Modify[0] != "a.txt" {
+		t.Fatalf("expected Modify=[a.txt], got %v", plan.Modify)
+	}
+	// c.txt should be Unchanged
+	if plan.Unchanged != 1 {
+		t.Fatalf("expected Unchanged=1, got %d", plan.Unchanged)
+	}
+	// HasChanges should be true
+	if !plan.HasChanges() {
+		t.Fatal("HasChanges should be true")
+	}
+}
+
+func TestPreviewDetectsChmod(t *testing.T) {
+	s, dir := setup(t)
+
+	writeFile(t, dir, "script.sh", "#!/bin/sh")
+	os.Chmod(filepath.Join(dir, "script.sh"), 0755)
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap1, err := c.TakeSnapshot(nil, "executable")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Change mode to 0644
+	os.Chmod(filepath.Join(dir, "script.sh"), 0644)
+
+	restorer := NewRestorer(s, dir, ig)
+	plan, err := restorer.Preview(snap1.ID)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+
+	if len(plan.Chmod) != 1 {
+		t.Fatalf("expected 1 chmod entry, got %d", len(plan.Chmod))
+	}
+	if plan.Chmod[0].Path != "script.sh" {
+		t.Fatalf("expected chmod for script.sh, got %s", plan.Chmod[0].Path)
+	}
+	if plan.Chmod[0].OldMode != 0644 {
+		t.Fatalf("expected old mode 0644, got %04o", plan.Chmod[0].OldMode)
+	}
+	if plan.Chmod[0].NewMode != 0755 {
+		t.Fatalf("expected new mode 0755, got %04o", plan.Chmod[0].NewMode)
+	}
+}
+
+func TestPreviewNoChanges(t *testing.T) {
+	s, dir := setup(t)
+
+	writeFile(t, dir, "a.txt", "hello")
+
+	ig, _ := ignore.New(nil)
+	c := NewCreator(s, dir, ig)
+	snap1, err := c.TakeSnapshot(nil, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restorer := NewRestorer(s, dir, ig)
+	plan, err := restorer.Preview(snap1.ID)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+
+	if plan.HasChanges() {
+		t.Fatalf("expected no changes, got Delete=%v Write=%v Modify=%v Chmod=%v",
+			plan.Delete, plan.Write, plan.Modify, plan.Chmod)
+	}
+	if plan.Unchanged != 1 {
+		t.Fatalf("expected 1 unchanged, got %d", plan.Unchanged)
+	}
+}
+
 func TestRestoreSkipsIgnoredPaths(t *testing.T) {
 	s, dir := setup(t)
 

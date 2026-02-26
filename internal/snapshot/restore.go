@@ -247,6 +247,158 @@ func splitPath(path string) []string {
 	return parts
 }
 
+// RestorePlan describes what a restore would do without making any changes.
+type RestorePlan struct {
+	Delete    []string
+	Write     []string
+	Modify    []string
+	Chmod     []ChmodEntry
+	Unchanged int
+}
+
+// ChmodEntry describes a file where only permissions differ.
+type ChmodEntry struct {
+	Path    string
+	OldMode os.FileMode
+	NewMode os.FileMode
+}
+
+// HasChanges returns true if the plan includes any filesystem modifications.
+func (p *RestorePlan) HasChanges() bool {
+	return len(p.Delete) > 0 || len(p.Write) > 0 || len(p.Modify) > 0 || len(p.Chmod) > 0
+}
+
+// Preview computes what a restore would do without modifying the filesystem.
+func (r *Restorer) Preview(snapshotID int64) (*RestorePlan, error) {
+	targetFiles, err := r.store.GetSnapshotFiles(snapshotID)
+	if err != nil {
+		return nil, err
+	}
+
+	targetMap := make(map[string]store.SnapshotFile, len(targetFiles))
+	for _, f := range targetFiles {
+		targetMap[f.Path] = f
+	}
+
+	// Walk current filesystem to find existing tracked files
+	type diskFile struct {
+		relPath string
+		isLink  bool
+	}
+	var diskFiles []diskFile
+	if err := filepath.WalkDir(r.rootDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		relPath, _ := filepath.Rel(r.rootDir, path)
+		relPath = filepath.ToSlash(relPath)
+		if relPath == "." {
+			return nil
+		}
+		if r.ignore.Match(relPath) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Type().IsRegular() || d.Type()&os.ModeSymlink != 0 {
+			diskFiles = append(diskFiles, diskFile{
+				relPath: relPath,
+				isLink:  d.Type()&os.ModeSymlink != 0,
+			})
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("walking filesystem: %w", err)
+	}
+
+	diskMap := make(map[string]diskFile, len(diskFiles))
+	for _, df := range diskFiles {
+		diskMap[df.relPath] = df
+	}
+
+	plan := &RestorePlan{}
+
+	// Files to delete (on disk but not in target)
+	for _, df := range diskFiles {
+		if _, inTarget := targetMap[df.relPath]; !inTarget {
+			plan.Delete = append(plan.Delete, df.relPath)
+		}
+	}
+
+	// Files from target snapshot
+	for _, f := range targetFiles {
+		if r.ignore.Match(f.Path) {
+			continue
+		}
+
+		absPath, err := safePath(r.rootDir, f.Path)
+		if err != nil {
+			return nil, fmt.Errorf("unsafe path in snapshot: %w", err)
+		}
+
+		df, onDisk := diskMap[f.Path]
+		if !onDisk {
+			plan.Write = append(plan.Write, f.Path)
+			continue
+		}
+
+		// Type mismatch (file↔symlink) → modify
+		diskIsLink := df.isLink
+		targetIsLink := f.Type == "symlink"
+		if diskIsLink != targetIsLink {
+			plan.Modify = append(plan.Modify, f.Path)
+			continue
+		}
+
+		// Compare content
+		var currentHash string
+		if diskIsLink {
+			target, err := os.Readlink(absPath)
+			if err != nil {
+				plan.Modify = append(plan.Modify, f.Path)
+				continue
+			}
+			h := sha256.Sum256([]byte(target))
+			currentHash = hex.EncodeToString(h[:])
+		} else {
+			h, err := hashFile(absPath)
+			if err != nil {
+				plan.Modify = append(plan.Modify, f.Path)
+				continue
+			}
+			currentHash = h
+		}
+
+		if currentHash != f.BlobHash {
+			plan.Modify = append(plan.Modify, f.Path)
+			continue
+		}
+
+		// Content matches — check permissions (only for regular files)
+		if !diskIsLink {
+			info, err := os.Lstat(absPath)
+			if err == nil && info.Mode().Perm() != os.FileMode(f.Mode).Perm() {
+				plan.Chmod = append(plan.Chmod, ChmodEntry{
+					Path:    f.Path,
+					OldMode: info.Mode().Perm(),
+					NewMode: os.FileMode(f.Mode).Perm(),
+				})
+				continue
+			}
+		}
+
+		plan.Unchanged++
+	}
+
+	sort.Strings(plan.Delete)
+	sort.Strings(plan.Write)
+	sort.Strings(plan.Modify)
+	sort.Slice(plan.Chmod, func(i, j int) bool { return plan.Chmod[i].Path < plan.Chmod[j].Path })
+
+	return plan, nil
+}
+
 // hashFile computes the SHA-256 of a file by streaming, without loading it all into memory.
 func hashFile(path string) (string, error) {
 	f, err := os.Open(path)

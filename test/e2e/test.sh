@@ -352,7 +352,7 @@ sqlite3 "$db" "INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, m
 sqlite3 "$db" "INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, mod_time, size, type) VALUES ($mal_id, 'legit.txt', '$blob_hash', 420, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 5, 'file')"
 
 # Attempt restore — should fail
-if earwig restore deadbeefdeadbeefdeadbeef 2>/dev/null; then
+if earwig restore -y deadbeefdeadbeefdeadbeef 2>/dev/null; then
     fail "restore with traversal path should fail" "restore succeeded"
 else
     pass "restore with traversal path rejected"
@@ -872,7 +872,7 @@ sqlite3 "$db" "INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, m
 sqlite3 "$db" "INSERT INTO snapshot_files (snapshot_id, path, blob_hash, mode, mod_time, size, type) VALUES ($mal_id, 'legit.txt', '$blob_hash', 420, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 5, 'file')"
 
 # Restore the malicious snapshot
-earwig restore cafebabecafebabecafebabe > /dev/null 2>&1
+earwig restore -y cafebabecafebabecafebabe > /dev/null 2>&1
 
 # .earwig/evil.txt must NOT exist
 if [ -f ".earwig/evil.txt" ]; then
@@ -986,7 +986,9 @@ write_file "target.txt" "real content"
 ln -s target.txt link-relative
 snapshot                                        # snapshot #1
 
-restore_output=$(earwig restore "${SNAPSHOTS[0]}" 2>&1)
+# Remove symlink so restore needs to recreate it
+rm -f link-relative
+restore_output=$(earwig restore -y "${SNAPSHOTS[0]}" 2>&1)
 if echo "$restore_output" | grep -q "potentially unsafe target"; then
     fail "relative symlink should not warn" "got warning: $restore_output"
 else
@@ -998,7 +1000,9 @@ rm -f link-relative
 ln -s /tmp/absolute-target link-absolute
 snapshot                                        # snapshot #2
 
-warn_output=$(earwig restore "${SNAPSHOTS[1]}" 2>&1)
+# Remove symlink so restore needs to recreate it
+rm -f link-absolute
+warn_output=$(earwig restore -y "${SNAPSHOTS[1]}" 2>&1)
 if echo "$warn_output" | grep -q "potentially unsafe target"; then
     pass "absolute symlink target triggers warning"
 else
@@ -1011,7 +1015,9 @@ mkdir -p subdir
 ln -s ../outside link-dotdot
 snapshot                                        # snapshot #3
 
-warn_output2=$(earwig restore "${SNAPSHOTS[2]}" 2>&1)
+# Remove symlink so restore needs to recreate it
+rm -f link-dotdot
+warn_output2=$(earwig restore -y "${SNAPSHOTS[2]}" 2>&1)
 if echo "$warn_output2" | grep -q "potentially unsafe target"; then
     pass "dotdot symlink target triggers warning"
 else
@@ -1183,6 +1189,169 @@ fi
 write_file "b.txt" "after gc"
 snapshot                                        # snapshot #2
 expect_snapshot_count 2
+
+# =========================================================
+# TEST 34: earwig diff command
+# =========================================================
+blue "=== TEST 34: earwig diff ==="
+
+init_project /tmp/earwig-test-34
+
+write_file "a.txt" "hello"
+write_file "b.txt" "world"
+snapshot                                        # snapshot #1
+
+# Modify filesystem: change a.txt, delete b.txt, add c.txt
+write_file "a.txt" "changed"
+delete_file "b.txt"
+write_file "c.txt" "new"
+
+# diff should show the changes without modifying anything
+diff_output=$(earwig diff "${SNAPSHOTS[0]}" 2>&1)
+
+if echo "$diff_output" | grep -q "A b.txt"; then
+    pass "diff shows b.txt would be written (restored)"
+else
+    fail "diff shows b.txt would be written" "output: $diff_output"
+fi
+
+if echo "$diff_output" | grep -q "D c.txt"; then
+    pass "diff shows c.txt would be deleted"
+else
+    fail "diff shows c.txt would be deleted" "output: $diff_output"
+fi
+
+if echo "$diff_output" | grep -q "M a.txt"; then
+    pass "diff shows a.txt would be modified"
+else
+    fail "diff shows a.txt would be modified" "output: $diff_output"
+fi
+
+# Verify diff is read-only: filesystem unchanged
+expect_file "a.txt" "changed"
+expect_no_file "b.txt"
+expect_file "c.txt" "new"
+
+# =========================================================
+# TEST 35: interactive restore (cancel with n)
+# =========================================================
+blue "=== TEST 35: interactive restore cancel ==="
+
+init_project /tmp/earwig-test-35
+
+write_file "a.txt" "original"
+snapshot                                        # snapshot #1
+
+write_file "a.txt" "modified"
+snapshot                                        # snapshot #2
+
+# Restore to snapshot #1 but cancel
+cancel_output=$(echo "n" | earwig restore "${SNAPSHOTS[0]}" 2>&1)
+
+if echo "$cancel_output" | grep -q "Restore cancelled"; then
+    pass "restore cancelled on 'n'"
+else
+    fail "restore cancelled on 'n'" "output: $cancel_output"
+fi
+
+# File should NOT have been reverted
+expect_file "a.txt" "modified"
+
+# =========================================================
+# TEST 36: interactive restore (confirm with y)
+# =========================================================
+blue "=== TEST 36: interactive restore confirm ==="
+
+init_project /tmp/earwig-test-36
+
+write_file "a.txt" "original"
+snapshot                                        # snapshot #1
+
+write_file "a.txt" "modified"
+snapshot                                        # snapshot #2
+
+# Restore to snapshot #1 with y
+confirm_output=$(echo "y" | earwig restore "${SNAPSHOTS[0]}" 2>&1)
+
+if echo "$confirm_output" | grep -q "Restored to snapshot"; then
+    pass "restore proceeds on 'y'"
+else
+    fail "restore proceeds on 'y'" "output: $confirm_output"
+fi
+
+expect_file "a.txt" "original"
+
+# =========================================================
+# TEST 37: restore -y skips prompt
+# =========================================================
+blue "=== TEST 37: restore -y skips prompt ==="
+
+init_project /tmp/earwig-test-37
+
+write_file "a.txt" "original"
+snapshot                                        # snapshot #1
+
+write_file "a.txt" "modified"
+snapshot                                        # snapshot #2
+
+# Restore with -y (no stdin needed)
+earwig restore -y "${SNAPSHOTS[0]}" > /dev/null 2>&1
+expect_file "a.txt" "original"
+pass "restore -y works without stdin"
+
+# =========================================================
+# TEST 38: restore shows plan summary
+# =========================================================
+blue "=== TEST 38: restore shows plan ==="
+
+init_project /tmp/earwig-test-38
+
+write_file "keep.txt" "same"
+write_file "remove.txt" "will be deleted"
+snapshot                                        # snapshot #1
+
+write_file "keep.txt" "same"
+delete_file "remove.txt"
+write_file "added.txt" "new file"
+snapshot                                        # snapshot #2
+
+# Restore to snapshot #1 — plan should show delete/write/unchanged
+plan_output=$(echo "y" | earwig restore "${SNAPSHOTS[0]}" 2>&1)
+
+if echo "$plan_output" | grep -q "Delete.*file"; then
+    pass "restore plan shows deletions"
+else
+    fail "restore plan shows deletions" "output: $plan_output"
+fi
+
+if echo "$plan_output" | grep -q "Write.*file"; then
+    pass "restore plan shows writes"
+else
+    fail "restore plan shows writes" "output: $plan_output"
+fi
+
+# Verify restore actually happened
+expect_file "remove.txt" "will be deleted"
+expect_no_file "added.txt"
+
+# =========================================================
+# TEST 39: diff with no changes
+# =========================================================
+blue "=== TEST 39: diff no changes ==="
+
+init_project /tmp/earwig-test-39
+
+write_file "a.txt" "hello"
+snapshot                                        # snapshot #1
+
+# diff against current state (should show no differences)
+no_diff_output=$(earwig diff "${SNAPSHOTS[0]}" 2>&1)
+
+if echo "$no_diff_output" | grep -q "No differences"; then
+    pass "diff shows no differences when state matches"
+else
+    fail "diff shows no differences" "output: $no_diff_output"
+fi
 
 # =========================================================
 # DONE

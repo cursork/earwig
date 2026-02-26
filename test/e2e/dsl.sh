@@ -83,7 +83,7 @@ snapshot() {
 restore() {
     local n="$1"  # 1-indexed snapshot number
     local hash="${SNAPSHOTS[$((n - 1))]}"
-    earwig restore "$hash" > /dev/null
+    earwig restore -y "$hash" > /dev/null
     blue "  restore -> snapshot #$n ($hash)"
 }
 

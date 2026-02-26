@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -27,6 +29,7 @@ var commands = map[string]func([]string) error{
 	"show":     cmdShow,
 	"watch":    cmdWatch,
 	"restore":  cmdRestore,
+	"diff":     cmdDiff,
 	"gc":       cmdGC,
 	"forget":   cmdForget,
 	"_files":   cmdFiles,
@@ -481,8 +484,13 @@ func cmdWatch(args []string) error {
 }
 
 func cmdRestore(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("usage: earwig restore <hash>")
+	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
+	yes := fs.Bool("y", false, "skip confirmation prompt")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: earwig restore [-y] <hash>")
 	}
 
 	s, root, err := openStore()
@@ -491,7 +499,7 @@ func cmdRestore(args []string) error {
 	}
 	defer s.Close()
 
-	snap, err := s.GetSnapshot(args[0])
+	snap, err := s.GetSnapshot(fs.Arg(0))
 	if err != nil {
 		return err
 	}
@@ -507,6 +515,29 @@ func cmdRestore(args []string) error {
 		return fmt.Errorf("acquiring lock: %w", err)
 	}
 	defer flockFile.Close()
+
+	// Preview what the restore would do
+	restorer := snapshot.NewRestorer(s, root, ig)
+	plan, err := restorer.Preview(snap.ID)
+	if err != nil {
+		return fmt.Errorf("computing restore plan: %w", err)
+	}
+
+	if !plan.HasChanges() {
+		fmt.Println("Already at target state. Nothing to do.")
+		return nil
+	}
+
+	// Display the plan
+	printPlan(plan, snap)
+
+	// Confirm unless -y
+	if !*yes {
+		if !confirm("Proceed? [y/N]") {
+			fmt.Println("Restore cancelled.")
+			return nil
+		}
+	}
 
 	// Auto-snapshot current state before restore so the user can undo
 	parentID, err := readHead(root, s)
@@ -533,7 +564,6 @@ func cmdRestore(args []string) error {
 		}
 	}
 
-	restorer := snapshot.NewRestorer(s, root, ig)
 	if err := restorer.Restore(snap.ID); err != nil {
 		return err
 	}
@@ -546,6 +576,89 @@ func cmdRestore(args []string) error {
 	}
 	fmt.Printf("Restored to snapshot %s (%s)\n", shortHash(snap.Hash), snap.CreatedAt.Format("2006-01-02 15:04:05"))
 	return nil
+}
+
+func cmdDiff(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: earwig diff <hash>")
+	}
+
+	s, root, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	snap, err := s.GetSnapshot(args[0])
+	if err != nil {
+		return err
+	}
+
+	ig, err := loadIgnore(root)
+	if err != nil {
+		return err
+	}
+
+	restorer := snapshot.NewRestorer(s, root, ig)
+	plan, err := restorer.Preview(snap.ID)
+	if err != nil {
+		return err
+	}
+
+	if !plan.HasChanges() {
+		fmt.Println("No differences. Current state matches snapshot.")
+		return nil
+	}
+
+	printPlan(plan, snap)
+	return nil
+}
+
+func printPlan(plan *snapshot.RestorePlan, snap *store.Snapshot) {
+	fmt.Printf("Restore to %s (%s):\n\n", shortHash(snap.Hash), snap.CreatedAt.Format("2006-01-02 15:04:05"))
+
+	if len(plan.Delete) > 0 {
+		fmt.Printf("  Delete %d file(s):\n", len(plan.Delete))
+		for _, p := range plan.Delete {
+			fmt.Printf("    D %s\n", p)
+		}
+		fmt.Println()
+	}
+
+	if len(plan.Write) > 0 {
+		fmt.Printf("  Write %d file(s):\n", len(plan.Write))
+		for _, p := range plan.Write {
+			fmt.Printf("    A %s\n", p)
+		}
+		fmt.Println()
+	}
+
+	if len(plan.Modify) > 0 {
+		fmt.Printf("  Modify %d file(s):\n", len(plan.Modify))
+		for _, p := range plan.Modify {
+			fmt.Printf("    M %s\n", p)
+		}
+		fmt.Println()
+	}
+
+	if len(plan.Chmod) > 0 {
+		fmt.Printf("  Chmod %d file(s):\n", len(plan.Chmod))
+		for _, c := range plan.Chmod {
+			fmt.Printf("    C %s (%04o → %04o)\n", c.Path, c.OldMode, c.NewMode)
+		}
+		fmt.Println()
+	}
+
+	if plan.Unchanged > 0 {
+		fmt.Printf("  Unchanged: %d file(s)\n\n", plan.Unchanged)
+	}
+}
+
+func confirm(prompt string) bool {
+	fmt.Print(prompt + " ")
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	return strings.TrimSpace(strings.ToLower(line)) == "y"
 }
 
 func cmdForget(args []string) error {
