@@ -83,7 +83,9 @@ func (w *Watcher) Run(ctx context.Context) error {
 			// Use Lstat to avoid following symlinks into external dirs.
 			if event.Has(fsnotify.Create) {
 				if info, err := os.Lstat(event.Name); err == nil && info.IsDir() {
-					w.addRecursive(event.Name)
+					if err := w.addRecursive(event.Name); err != nil {
+						log.Printf("warning: watching new directory %s: %v", event.Name, err)
+					}
 				}
 			}
 

@@ -171,7 +171,7 @@ func (c *Creator) TakeIncrementalSnapshot(parentID int64, changedPaths map[strin
 
 		if info.IsDir() {
 			// New directory — walk it to discover new files
-			filepath.WalkDir(absPath, func(p string, d os.DirEntry, err error) error {
+			if walkErr := filepath.WalkDir(absPath, func(p string, d os.DirEntry, err error) error {
 				if err != nil {
 					return nil
 				}
@@ -200,7 +200,9 @@ func (c *Creator) TakeIncrementalSnapshot(parentID int64, changedPaths map[strin
 				}
 				fileMap[relPath] = sf
 				return nil
-			})
+			}); walkErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: walking new directory %s: %v\n", absPath, walkErr)
+			}
 			continue
 		}
 

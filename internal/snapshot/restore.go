@@ -75,7 +75,9 @@ func (r *Restorer) Restore(snapshotID int64) error {
 						origMode := dirInfo.Mode().Perm()
 						if chErr := os.Chmod(dir, 0755); chErr == nil {
 							err2 := os.Remove(absPath)
-							os.Chmod(dir, origMode)
+							if restoreErr := os.Chmod(dir, origMode); restoreErr != nil {
+								fmt.Fprintf(os.Stderr, "warning: could not restore permissions on %s: %v\n", dir, restoreErr)
+							}
 							if err2 == nil || os.IsNotExist(err2) {
 								continue
 							}
@@ -180,7 +182,7 @@ func (r *Restorer) Restore(snapshotID int64) error {
 
 	// Clean up empty directories (bottom-up)
 	var dirs []string
-	filepath.WalkDir(r.rootDir, func(path string, d os.DirEntry, err error) error {
+	if err := filepath.WalkDir(r.rootDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -199,12 +201,14 @@ func (r *Restorer) Restore(snapshotID int64) error {
 			dirs = append(dirs, path)
 		}
 		return nil
-	})
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: scanning for empty directories: %v\n", err)
+	}
 
 	// Sort deepest first
 	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
 	for _, dir := range dirs {
-		os.Remove(dir) // Only succeeds if empty
+		_ = os.Remove(dir) // best effort; only succeeds if empty
 	}
 
 	return nil

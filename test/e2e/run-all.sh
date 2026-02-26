@@ -19,10 +19,10 @@ echo ""
 echo "========================================="
 echo " Generative E2E tests"
 echo "========================================="
-for seed in 42 1337 9999; do
+for i in 1 2 3; do
     echo ""
-    echo "--- seed=$seed ---"
-    if ! earwig-gen 200 "$seed"; then
+    echo "--- run $i (random seed) ---"
+    if ! earwig-gen 200; then
         failed=1
     fi
 done

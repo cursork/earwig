@@ -154,10 +154,14 @@ func cmdInit(args []string) error {
 
 	s, err := store.Open(filepath.Join(earwigDir, "earwig.db"))
 	if err != nil {
-		os.RemoveAll(earwigDir)
+		if rmErr := os.RemoveAll(earwigDir); rmErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not clean up %s: %v\n", earwigDir, rmErr)
+		}
 		return fmt.Errorf("creating database: %w", err)
 	}
-	s.Close()
+	if err := s.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: closing database: %v\n", err)
+	}
 
 	fmt.Printf("Initialized earwig in %s\n", cwd)
 	return nil
@@ -380,7 +384,9 @@ func acquireFlock(root string, blocking bool) (*os.File, error) {
 		how |= syscall.LOCK_NB
 	}
 	if err := syscall.Flock(int(f.Fd()), how); err != nil {
-		f.Close()
+		if closeErr := f.Close(); closeErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: closing flock file: %v\n", closeErr)
+		}
 		if !blocking && (errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN)) {
 			return nil, nil // lock held by another process
 		}

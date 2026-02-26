@@ -28,28 +28,22 @@ func Open(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("pinging database: %w", err)
+		return nil, errors.Join(fmt.Errorf("pinging database: %w", err), db.Close())
 	}
 
 	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
 	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("creating zstd encoder: %w", err)
+		return nil, errors.Join(fmt.Errorf("creating zstd encoder: %w", err), db.Close())
 	}
 	dec, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(512*1024*1024))
 	if err != nil {
-		db.Close()
-		enc.Close()
-		return nil, fmt.Errorf("creating zstd decoder: %w", err)
+		return nil, errors.Join(fmt.Errorf("creating zstd decoder: %w", err), enc.Close(), db.Close())
 	}
 
 	s := &Store{db: db, zstdEnc: enc, zstdDec: dec}
 	if err := s.migrate(); err != nil {
-		db.Close()
-		enc.Close()
 		dec.Close()
-		return nil, fmt.Errorf("migrating database: %w", err)
+		return nil, errors.Join(fmt.Errorf("migrating database: %w", err), enc.Close(), db.Close())
 	}
 	return s, nil
 }
