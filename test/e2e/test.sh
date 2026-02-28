@@ -440,7 +440,7 @@ kill $WATCH_PID 2>/dev/null || true
 wait $WATCH_PID 2>/dev/null || true
 
 # Check that the watcher created at least one snapshot (its initial full walk)
-watch_snaps=$(earwig log 2>/dev/null | grep -c '^\*' || true)
+watch_snaps=$(earwig log 2>/dev/null | grep -c '[*]' || true)
 # We expect: snapshot #1 (manual) + watcher initial snapshot = at least 2
 if [ "$watch_snaps" -ge 2 ]; then
     pass "watcher created snapshots ($watch_snaps total)"
@@ -449,7 +449,7 @@ else
 fi
 
 # The watched file should appear in the watcher's initial snapshot
-latest_hash=$(earwig log 2>/dev/null | head -1 | awk '{print $2}')
+latest_hash=$(earwig log 2>/dev/null | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}')
 files_output=$(earwig _files "$latest_hash" 2>/dev/null)
 if echo "$files_output" | grep -q "watched.txt"; then
     pass "watched.txt appears in watcher snapshot"

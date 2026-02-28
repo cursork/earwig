@@ -202,7 +202,7 @@ func cmdSnapshot(args []string) error {
 }
 
 func cmdLog(args []string) error {
-	s, _, err := openStore()
+	s, root, err := openStore()
 	if err != nil {
 		return err
 	}
@@ -218,30 +218,211 @@ func cmdLog(args []string) error {
 		return nil
 	}
 
-	// Build children map to detect branches
-	children := make(map[int64][]int64)
-	for _, snap := range snapshots {
-		if snap.ParentID != nil {
-			children[*snap.ParentID] = append(children[*snap.ParentID], snap.ID)
-		}
+	headID, err := readHead(root, s)
+	if err != nil {
+		return err
 	}
 
+	// Graph state: each column tracks which snapshot ID it's tracing toward.
+	// 0 means the slot is free.
+	var columns []int64
+
+	// Pre-seed column 0 with HEAD so its lineage stays leftmost.
+	if headID != nil {
+		columns = []int64{*headID}
+	}
+
+	// Process newest-first
 	for i := len(snapshots) - 1; i >= 0; i-- {
 		snap := snapshots[i]
-		branchMark := ""
-		if snap.ParentID != nil {
-			if siblings := children[*snap.ParentID]; len(siblings) > 1 {
-				branchMark = " (branch)"
+
+		// Find all columns targeting this snapshot
+		var matchCols []int
+		for c, target := range columns {
+			if target == snap.ID {
+				matchCols = append(matchCols, c)
 			}
 		}
-		fmt.Printf("* %s  %s  %s%s\n",
+
+		// If no column tracks this snapshot, it's a branch tip — allocate a column
+		if len(matchCols) == 0 {
+			col := -1
+			for c, target := range columns {
+				if target == 0 {
+					col = c
+					break
+				}
+			}
+			if col == -1 {
+				col = len(columns)
+				columns = append(columns, 0)
+			}
+			columns[col] = snap.ID
+			matchCols = []int{col}
+		}
+
+		ownCol := matchCols[0]
+
+		// If multiple columns converge here, draw merge separator line(s).
+		// Each row moves merging columns one position closer to ownCol.
+		if len(matchCols) > 1 {
+			extraCols := matchCols[1:]
+			// Animate: each step moves every extra column one position left
+			maxDist := 0
+			for _, mc := range extraCols {
+				if d := mc - ownCol; d > maxDist {
+					maxDist = d
+				}
+			}
+			for step := 1; step <= maxDist; step++ {
+				fmt.Println(strings.TrimRight(
+					drawMergeLine(columns, ownCol, extraCols, step),
+					" "))
+			}
+			// Free the extra columns
+			for _, mc := range extraCols {
+				columns[mc] = 0
+			}
+		}
+
+		// Trim trailing empty columns before drawing commit line
+		for len(columns) > 0 && columns[len(columns)-1] == 0 {
+			columns = columns[:len(columns)-1]
+		}
+
+		// Build the commit line graph prefix
+		prefix := drawGraphPrefix(columns, ownCol)
+
+		// Build A/M/D change summary
+		changeSummary := changeSummaryFor(s, &snap)
+
+		// HEAD marker
+		headMark := ""
+		if headID != nil && snap.ID == *headID {
+			headMark = "  <- HERE"
+		}
+
+		fmt.Printf("%s%s  %s  %s%s%s\n",
+			prefix,
 			shortHash(snap.Hash),
 			snap.CreatedAt.Format("2006-01-02 15:04:05"),
 			snap.Message,
-			branchMark,
+			changeSummary,
+			headMark,
 		)
+
+		// Update the kept column to trace toward this snapshot's parent
+		if snap.ParentID != nil {
+			columns[ownCol] = *snap.ParentID
+		} else {
+			columns[ownCol] = 0 // root — free the column
+		}
+
+		// Trim trailing empty columns
+		for len(columns) > 0 && columns[len(columns)-1] == 0 {
+			columns = columns[:len(columns)-1]
+		}
 	}
 	return nil
+}
+
+// drawGraphPrefix builds the "* | | " prefix for a commit line.
+func drawGraphPrefix(columns []int64, ownCol int) string {
+	var b strings.Builder
+	for c := 0; c < len(columns); c++ {
+		if c == ownCol {
+			b.WriteByte('*')
+		} else if columns[c] != 0 {
+			b.WriteByte('|')
+		} else {
+			b.WriteByte(' ')
+		}
+		b.WriteByte(' ')
+	}
+	return b.String()
+}
+
+// drawMergeLine draws one row of the merge animation.
+// Each extra column moves `step` positions to the left toward ownCol.
+// Uses character-level positioning so "/" appears right next to "|".
+func drawMergeLine(columns []int64, ownCol int, extraCols []int, step int) string {
+	width := len(columns)
+	// Total character positions: each column gets 2 chars (symbol + space)
+	chars := make([]byte, width*2)
+	for i := range chars {
+		chars[i] = ' '
+	}
+	// Draw continuing columns
+	for c := 0; c < width; c++ {
+		if columns[c] != 0 {
+			isExtra := false
+			for _, mc := range extraCols {
+				if mc == c {
+					isExtra = true
+					break
+				}
+			}
+			if !isExtra {
+				chars[c*2] = '|'
+			}
+		}
+	}
+	// Draw the merging "/" indicators at their animated positions
+	for _, mc := range extraCols {
+		pos := mc - step
+		if pos <= ownCol {
+			pos = ownCol
+		}
+		// Place "/" at the character position. If pos == ownCol, it goes at
+		// ownCol*2+1 (right after the "|") to get the "|\/" look.
+		// Otherwise at pos*2 to show diagonal movement.
+		if pos == ownCol {
+			chars[ownCol*2+1] = '/'
+		} else {
+			chars[pos*2] = '/'
+		}
+	}
+	return string(chars)
+}
+
+func changeSummaryFor(s *store.Store, snap *store.Snapshot) string {
+	var parts []string
+	if snap.ParentID == nil {
+		files, err := s.GetSnapshotFiles(snap.ID)
+		if err != nil {
+			return ""
+		}
+		for _, f := range files {
+			parts = append(parts, "A "+filepath.Base(f.Path))
+		}
+	} else {
+		changes, err := s.DiffSnapshots(*snap.ParentID, snap.ID)
+		if err != nil {
+			return ""
+		}
+		for _, c := range changes {
+			var prefix string
+			switch c.Type {
+			case store.ChangeAdded:
+				prefix = "A"
+			case store.ChangeModified:
+				prefix = "M"
+			case store.ChangeDeleted:
+				prefix = "D"
+			}
+			parts = append(parts, prefix+" "+filepath.Base(c.Path))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	summary := "  [" + strings.Join(parts, ", ")
+	const maxLen = 50
+	if len(summary) > maxLen {
+		summary = summary[:maxLen-3] + "..."
+	}
+	summary += "]"
+	return summary
 }
 
 func cmdShow(args []string) error {

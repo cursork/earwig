@@ -140,7 +140,7 @@ expect_dir() {
 expect_snapshot_count() {
     local expected="$1"
     local actual
-    actual=$(earwig log 2>/dev/null | grep -c '^\*' || true)
+    actual=$(earwig log 2>/dev/null | grep -c '[*]' || true)
     if [ "$actual" -eq "$expected" ]; then
         pass "snapshot count == $expected"
     else
@@ -163,7 +163,7 @@ expect_show_change() {
 expect_log_has_branch() {
     local output
     output=$(earwig log 2>&1)
-    if echo "$output" | grep -q "(branch)"; then
+    if echo "$output" | grep -q '|/'; then
         pass "log contains branch marker"
     else
         fail "log contains branch marker" "output: $output"

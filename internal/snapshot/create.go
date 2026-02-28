@@ -85,34 +85,12 @@ func (c *Creator) TakeSnapshot(parentID *int64, message string) (*store.Snapshot
 			return nil
 		}
 
-		info, err := d.Info()
+		sf, err := c.readFile(path, relPath)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: skipping %s: %v\n", relPath, err)
 			return nil
 		}
-		if maxFileSize >= 0 && info.Size() > maxFileSize {
-			fmt.Fprintf(os.Stderr, "warning: skipping %s (%.1f MB exceeds %d MB limit)\n",
-				relPath, float64(info.Size())/(1024*1024), maxFileSize/(1024*1024))
-			return nil
-		}
-
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil // Skip unreadable files
-		}
-
-		blobHash, err := c.store.PutBlob(data)
-		if err != nil {
-			return err
-		}
-
-		files = append(files, store.SnapshotFile{
-			Path:     relPath,
-			BlobHash: blobHash,
-			Mode:     uint32(info.Mode().Perm()),
-			ModTime:  info.ModTime(),
-			Size:     info.Size(),
-			Type:     "file",
-		})
+		files = append(files, sf)
 
 		return nil
 	})
