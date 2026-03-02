@@ -5,6 +5,20 @@ import (
 	"strings"
 )
 
+// validateEncoding checks that a blob encoding from the database is one of the
+// two supported values. Rejects unknown encodings that could bypass validation
+// in GetBlob (a crafted DB with encoding="garbage" would skip both the "raw"
+// and "zstd" branches).
+//
+// @ ensures err == nil ==> (encoding == "raw" || encoding == "zstd")
+// @ ensures err != nil ==> err.ErrorMem()
+func validateEncoding(encoding string) (err error) {
+	if encoding != "raw" && encoding != "zstd" {
+		return fmt.Errorf("unknown blob encoding %q", encoding)
+	}
+	return nil
+}
+
 // chooseEncoding decides whether to use zstd compression for a blob based on
 // data size and compression ratio.
 //

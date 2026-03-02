@@ -61,8 +61,7 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) PutBlob(data []byte) (string, error) {
-	h := sha256.Sum256(data)
-	hash := hex.EncodeToString(h[:])
+	hash := computeBlobHash(data)
 
 	stored := data
 	compressed := data // default: no compression attempted
@@ -98,6 +97,12 @@ func (s *Store) GetBlob(hash string) ([]byte, error) {
 		return nil, fmt.Errorf("getting blob %s: %w", hash, err)
 	}
 
+	// Reject unknown encodings (a crafted DB with encoding="garbage" would
+	// skip both the "raw" and "zstd" branches below).
+	if err := validateEncoding(encoding); err != nil {
+		return nil, fmt.Errorf("blob %s: %w", hash, err)
+	}
+
 	if size > maxBlobSize {
 		return nil, fmt.Errorf("blob %s: stored size %d exceeds maximum %d", hash, size, maxBlobSize)
 	}
@@ -120,9 +125,9 @@ func (s *Store) GetBlob(hash string) ([]byte, error) {
 	}
 
 	// Verify content hash to detect DB corruption or tampering.
-	actual := sha256.Sum256(data)
-	if hex.EncodeToString(actual[:]) != hash {
-		return nil, fmt.Errorf("blob %s: integrity check failed (actual hash %s)", hash, hex.EncodeToString(actual[:]))
+	actualHash := computeBlobHash(data)
+	if actualHash != hash {
+		return nil, fmt.Errorf("blob %s: integrity check failed (actual hash %s)", hash, actualHash)
 	}
 
 	return data, nil

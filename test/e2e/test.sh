@@ -1479,6 +1479,33 @@ restore 1
 expect_file_size "bigfile.txt" "204800"
 
 # =========================================================
+# TEST 43: Crafted DB — invalid blob encoding rejected
+# =========================================================
+blue "=== TEST 43: Crafted DB invalid encoding ==="
+
+init_project /tmp/earwig-test-43
+
+write_file "data.txt" "some content"
+snapshot                                        # snapshot #1
+
+# Modify the file so restore actually needs to fetch the blob
+write_file "data.txt" "different content"
+
+db=".earwig/earwig.db"
+blob_hash=$(sqlite3 "$db" "SELECT blob_hash FROM snapshot_files LIMIT 1")
+
+# Set encoding to an invalid value
+sqlite3 "$db" "UPDATE blobs SET encoding = 'garbage' WHERE hash = '$blob_hash'"
+
+# GetBlob should now fail with unknown encoding when restore tries to read the blob
+restore_output=$(earwig restore -y "${SNAPSHOTS[0]}" 2>&1 || true)
+if echo "$restore_output" | grep -qi "unknown blob encoding"; then
+    pass "invalid blob encoding rejected on restore"
+else
+    fail "invalid blob encoding rejected" "output: $restore_output"
+fi
+
+# =========================================================
 # DONE
 # =========================================================
 summary

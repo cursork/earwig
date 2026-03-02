@@ -1063,6 +1063,80 @@ func TestPathConflictSingleFile(t *testing.T) {
 	}
 }
 
+// --- validateEncoding tests ---
+
+func TestValidateEncodingValid(t *testing.T) {
+	if err := validateEncoding("raw"); err != nil {
+		t.Fatalf("raw should be valid: %v", err)
+	}
+	if err := validateEncoding("zstd"); err != nil {
+		t.Fatalf("zstd should be valid: %v", err)
+	}
+}
+
+func TestValidateEncodingInvalid(t *testing.T) {
+	tests := []string{"", "gzip", "garbage", "RAW", "ZSTD", "lz4"}
+	for _, enc := range tests {
+		if err := validateEncoding(enc); err == nil {
+			t.Fatalf("encoding %q should be invalid", enc)
+		}
+	}
+}
+
+// --- computeBlobHash tests ---
+
+func TestComputeBlobHashLength(t *testing.T) {
+	result := computeBlobHash([]byte("hello world"))
+	if len(result) != 64 {
+		t.Fatalf("expected 64 chars, got %d", len(result))
+	}
+}
+
+func TestComputeBlobHashDeterministic(t *testing.T) {
+	data := []byte("test data")
+	h1 := computeBlobHash(data)
+	h2 := computeBlobHash(data)
+	if h1 != h2 {
+		t.Fatalf("same data should produce same hash: %s != %s", h1, h2)
+	}
+}
+
+func TestComputeBlobHashMatchesManual(t *testing.T) {
+	data := []byte("hello")
+	got := computeBlobHash(data)
+	// SHA-256 of "hello" = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+	want := "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	if got != want {
+		t.Fatalf("computeBlobHash(%q) = %s, want %s", data, got, want)
+	}
+}
+
+// --- GetBlob rejects unknown encoding ---
+
+func TestGetBlobRejectsUnknownEncoding(t *testing.T) {
+	s := testStore(t)
+	data := []byte("hello world")
+
+	hash, err := s.PutBlob(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set encoding to garbage
+	_, err = s.db.Exec(`UPDATE blobs SET encoding = 'garbage' WHERE hash = ?`, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.GetBlob(hash)
+	if err == nil {
+		t.Fatal("expected error for unknown encoding, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown blob encoding") {
+		t.Fatalf("expected unknown blob encoding error, got: %v", err)
+	}
+}
+
 // --- GetBlob raw size mismatch with large size ---
 
 func TestGetBlobRejectsRawSizeLargerThanData(t *testing.T) {

@@ -922,6 +922,33 @@ func TestPreviewNoChanges(t *testing.T) {
 	}
 }
 
+// --- isUnsafeSymlinkTarget tests ---
+
+func TestIsUnsafeSymlinkTarget(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+		want   bool
+	}{
+		{"absolute path", "/etc/passwd", true},
+		{"dotdot component", "../escape", true},
+		{"dotdot in middle", "foo/../bar", true},
+		{"just dotdot", "..", true},
+		{"normal relative", "sibling.txt", false},
+		{"nested relative", "sub/dir/file.txt", false},
+		{"dot in name", "file..name.txt", true}, // Contains ".." even if not a path component
+		{"empty", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isUnsafeSymlinkTarget(tt.target)
+			if got != tt.want {
+				t.Fatalf("isUnsafeSymlinkTarget(%q) = %v, want %v", tt.target, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRestoreSkipsIgnoredPaths(t *testing.T) {
 	s, dir := setup(t)
 

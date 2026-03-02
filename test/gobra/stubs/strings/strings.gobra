@@ -9,6 +9,11 @@ package strings
 decreases
 func ContainsRune(s string, r rune) bool
 
+// Contains reports whether substr is within s.
+pure
+decreases
+func Contains(s string, substr string) bool
+
 // HasPrefix tests whether the string s begins with prefix.
 decreases
 pure func HasPrefix(s, prefix string) (ret bool) {

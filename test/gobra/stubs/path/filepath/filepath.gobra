@@ -14,6 +14,7 @@ package filepath
 const Separator = "/"
 
 // IsAbs reports whether the path is absolute.
+pure
 decreases
 func IsAbs(path string) bool
 
