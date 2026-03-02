@@ -65,13 +65,13 @@ func (s *Store) PutBlob(data []byte) (string, error) {
 	hash := hex.EncodeToString(h[:])
 
 	stored := data
-	encoding := "raw"
+	compressed := data // default: no compression attempted
 	if len(data) >= 128*1024 {
-		compressed := s.zstdEnc.EncodeAll(data, make([]byte, 0, len(data)/2))
-		if len(compressed) < len(data) {
-			stored = compressed
-			encoding = "zstd"
-		}
+		compressed = s.zstdEnc.EncodeAll(data, make([]byte, 0, len(data)/2))
+	}
+	encoding, useCompressed := chooseEncoding(len(data), len(compressed))
+	if useCompressed {
+		stored = compressed
 	}
 
 	_, err := s.db.Exec(
@@ -102,13 +102,19 @@ func (s *Store) GetBlob(hash string) ([]byte, error) {
 		return nil, fmt.Errorf("blob %s: stored size %d exceeds maximum %d", hash, size, maxBlobSize)
 	}
 
+	if encoding == "raw" {
+		if err := checkBlobSize(len(data), size, maxBlobSize); err != nil {
+			return nil, fmt.Errorf("blob %s: %w", hash, err)
+		}
+	}
+
 	if encoding == "zstd" {
 		decoded, err := s.zstdDec.DecodeAll(data, make([]byte, 0, size))
 		if err != nil {
 			return nil, fmt.Errorf("decompressing blob %s: %w", hash, err)
 		}
-		if int64(len(decoded)) != size {
-			return nil, fmt.Errorf("blob %s: decompressed size %d != stored size %d", hash, len(decoded), size)
+		if err := checkBlobSize(len(decoded), size, maxBlobSize); err != nil {
+			return nil, fmt.Errorf("blob %s: %w", hash, err)
 		}
 		data = decoded
 	}
@@ -192,22 +198,29 @@ func (s *Store) CreateSnapshot(parentID *int64, files []SnapshotFile, message st
 	// Validate path consistency: no path should be a prefix of another
 	// (e.g. "foo" and "foo/bar.txt" can't coexist — "foo" can't be both
 	// a file and a directory).
-	for i := 1; i < len(sorted); i++ {
-		prev := sorted[i-1].Path + "/"
-		if strings.HasPrefix(sorted[i].Path, prev) {
-			return nil, fmt.Errorf("path conflict: %q and %q", sorted[i-1].Path, sorted[i].Path)
-		}
+	paths := make([]string, len(sorted))
+	for i, f := range sorted {
+		paths[i] = f.Path
+	}
+	if err := validatePathConflicts(paths); err != nil {
+		return nil, err
 	}
 
-	for _, f := range files {
-		fileType := f.Type
-		if fileType == "" {
-			fileType = "file"
+	// Validate and collect file types.
+	types := make([]string, len(files))
+	for i, f := range files {
+		t := f.Type
+		if t == "" {
+			t = "file"
 		}
-		if fileType != "file" && fileType != "symlink" {
-			return nil, fmt.Errorf("invalid file type %q for %s", fileType, f.Path)
-		}
-		_, err := stmt.Exec(id, f.Path, f.BlobHash, f.Mode, f.ModTime.Format(time.RFC3339), f.Size, fileType)
+		types[i] = t
+	}
+	if err := validateFileTypes(types); err != nil {
+		return nil, err
+	}
+
+	for i, f := range files {
+		_, err := stmt.Exec(id, f.Path, f.BlobHash, f.Mode, f.ModTime.Format(time.RFC3339), f.Size, types[i])
 		if err != nil {
 			return nil, fmt.Errorf("inserting snapshot file %s: %w", f.Path, err)
 		}
@@ -424,20 +437,28 @@ func (s *Store) DiffSnapshots(oldID, newID int64) ([]FileChange, error) {
 
 	var changes []FileChange
 
-	// Added or modified
-	for path, nf := range newMap {
-		of, exists := oldMap[path]
-		if !exists {
-			changes = append(changes, FileChange{Path: path, Type: ChangeAdded, NewHash: nf.BlobHash})
-		} else if of.BlobHash != nf.BlobHash || of.Type != nf.Type || of.Mode != nf.Mode {
-			changes = append(changes, FileChange{Path: path, Type: ChangeModified, OldHash: of.BlobHash, NewHash: nf.BlobHash})
-		}
+	// Classify every path that appears in either snapshot
+	seen := make(map[string]bool, len(oldMap)+len(newMap))
+	for path := range oldMap {
+		seen[path] = true
+	}
+	for path := range newMap {
+		seen[path] = true
 	}
 
-	// Deleted
-	for path, of := range oldMap {
-		if _, exists := newMap[path]; !exists {
+	for path := range seen {
+		of, inOld := oldMap[path]
+		nf, inNew := newMap[path]
+		contentDiffers := inOld && inNew && (of.BlobHash != nf.BlobHash || of.Type != nf.Type || of.Mode != nf.Mode)
+
+		switch classifyFileChange(inOld, inNew, contentDiffers) {
+		case "added":
+			changes = append(changes, FileChange{Path: path, Type: ChangeAdded, NewHash: nf.BlobHash})
+		case "deleted":
 			changes = append(changes, FileChange{Path: path, Type: ChangeDeleted, OldHash: of.BlobHash})
+		case "modified":
+			changes = append(changes, FileChange{Path: path, Type: ChangeModified, OldHash: of.BlobHash, NewHash: nf.BlobHash})
+		// "unchanged" — no entry needed
 		}
 	}
 

@@ -1,0 +1,14 @@
+// Gobra stubs for Go os package
+
+// +gobra
+
+package os
+
+// FileMode represents a file's mode and permission bits.
+type FileMode uint32
+
+// Perm returns the Unix permission bits in m (m & 0o777).
+// After this call, no bits above 0o777 are set.
+ensures result == FileMode(m & 0x1FF)
+decreases
+pure func (m FileMode) Perm() (result FileMode)

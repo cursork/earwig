@@ -8,7 +8,11 @@ import (
 
 // safePath validates that relPath resolves to a location within rootDir.
 // Returns the cleaned absolute path or an error if the path escapes the root.
-func safePath(rootDir, relPath string) (string, error) {
+// @ ensures err == nil ==> len(result) > 0
+// @ ensures err == nil ==> strings.HasPrefix(result, filepath.Clean(rootDir) + string(filepath.Separator))
+// @ ensures err != nil ==> result == ""
+// @ ensures err != nil ==> err.ErrorMem()
+func safePath(rootDir, relPath string) (result string, err error) {
 	if relPath == "" {
 		return "", fmt.Errorf("empty path")
 	}

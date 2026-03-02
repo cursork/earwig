@@ -1,0 +1,16 @@
+// Gobra stubs for Go strings package
+// Based on VerifiedSCION stubs
+
+// +gobra
+
+package strings
+
+// ContainsRune reports whether the Unicode code point r is within s.
+decreases
+func ContainsRune(s string, r rune) bool
+
+// HasPrefix tests whether the string s begins with prefix.
+decreases
+pure func HasPrefix(s, prefix string) (ret bool) {
+	return len(s) >= len(prefix) && (s[0:len(prefix)] == prefix)
+}

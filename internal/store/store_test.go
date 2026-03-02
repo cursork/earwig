@@ -494,8 +494,8 @@ func TestGetBlobVerifiesHash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Tamper with the blob data in the DB
-	_, err = s.db.Exec(`UPDATE blobs SET data = ? WHERE hash = ?`, []byte("tampered"), hash)
+	// Tamper with the blob data in the DB (same length so size check passes)
+	_, err = s.db.Exec(`UPDATE blobs SET data = ? WHERE hash = ?`, []byte("hello tampr"), hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -784,6 +784,73 @@ func TestCreateSnapshotAllowsNonConflictingPaths(t *testing.T) {
 	}
 }
 
+// Bug fix: path conflict detection with intervening paths.
+// "foo" and "foo/bar.txt" conflict, but "foo-bar/baz.txt" sorts between them
+// and the old adjacent-pair check missed the conflict.
+func TestCreateSnapshotRejectsNonAdjacentPathConflict(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("content"))
+	now := time.Now()
+
+	_, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "foo", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+		{Path: "foo-bar/baz.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+		{Path: "foo/bar.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+	}, "non-adjacent conflict")
+	if err == nil {
+		t.Fatal("expected error for non-adjacent path conflict (foo vs foo/bar.txt)")
+	}
+	if !strings.Contains(err.Error(), "path conflict") {
+		t.Fatalf("expected path conflict error, got: %v", err)
+	}
+}
+
+// Bug fix: GetBlob raw blob size mismatch.
+// A crafted DB row with raw encoding but mismatched size should be rejected.
+func TestGetBlobRejectsRawSizeMismatch(t *testing.T) {
+	s := testStore(t)
+	data := []byte("small data")
+
+	hash, err := s.PutBlob(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set a wrong size (smaller than actual data) to simulate crafted DB
+	_, err = s.db.Exec(`UPDATE blobs SET size = ? WHERE hash = ?`, 5, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.GetBlob(hash)
+	if err == nil {
+		t.Fatal("expected error for raw blob with mismatched size")
+	}
+	if !strings.Contains(err.Error(), "data length") {
+		t.Fatalf("expected data length mismatch error, got: %v", err)
+	}
+}
+
+// Verify validatePathConflicts with multiple stacked potential parents
+func TestValidatePathConflictsDeepNesting(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("content"))
+	now := time.Now()
+
+	// "a", "a/b", "a/b/c.txt" — "a" conflicts with "a/b"
+	_, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+		{Path: "a/b", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+		{Path: "a/b/c.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+	}, "deep conflict")
+	if err == nil {
+		t.Fatal("expected error for deep nested path conflict")
+	}
+	if !strings.Contains(err.Error(), "path conflict") {
+		t.Fatalf("expected path conflict error, got: %v", err)
+	}
+}
+
 // S7: DeleteSnapshot removes snapshot and re-parents children.
 func TestDeleteSnapshot(t *testing.T) {
 	s := testStore(t)
@@ -842,5 +909,179 @@ func TestDeleteSnapshotReparentsToNull(t *testing.T) {
 	got, _ := s.GetSnapshot(snap2.Hash)
 	if got.ParentID != nil {
 		t.Fatalf("snap2 should have nil parent after root deleted, got %v", got.ParentID)
+	}
+}
+
+// --- chooseEncoding tests ---
+
+func TestChooseEncodingSmallData(t *testing.T) {
+	// Data below threshold → always raw, regardless of compression ratio
+	enc, use := chooseEncoding(100, 50)
+	if enc != "raw" || use {
+		t.Fatalf("small data: expected raw/false, got %s/%v", enc, use)
+	}
+}
+
+func TestChooseEncodingLargeCompressible(t *testing.T) {
+	// Data above threshold, compression helped
+	enc, use := chooseEncoding(200*1024, 100*1024)
+	if enc != "zstd" || !use {
+		t.Fatalf("large compressible: expected zstd/true, got %s/%v", enc, use)
+	}
+}
+
+func TestChooseEncodingLargeIncompressible(t *testing.T) {
+	// Data above threshold, compression didn't help (same size or larger)
+	enc, use := chooseEncoding(200*1024, 200*1024)
+	if enc != "raw" || use {
+		t.Fatalf("large incompressible: expected raw/false, got %s/%v", enc, use)
+	}
+	enc, use = chooseEncoding(200*1024, 300*1024)
+	if enc != "raw" || use {
+		t.Fatalf("large expanded: expected raw/false, got %s/%v", enc, use)
+	}
+}
+
+func TestChooseEncodingBoundary(t *testing.T) {
+	// Exactly at threshold
+	enc, _ := chooseEncoding(128*1024, 128*1024-1)
+	if enc != "zstd" {
+		t.Fatalf("at threshold with savings: expected zstd, got %s", enc)
+	}
+	enc, _ = chooseEncoding(128*1024-1, 0)
+	if enc != "raw" {
+		t.Fatalf("below threshold: expected raw, got %s", enc)
+	}
+}
+
+// --- classifyFileChange tests ---
+
+func TestClassifyFileChange(t *testing.T) {
+	tests := []struct {
+		name           string
+		inOld, inNew   bool
+		contentDiffers bool
+		want           string
+	}{
+		{"added", false, true, false, "added"},
+		{"deleted", true, false, false, "deleted"},
+		{"modified", true, true, true, "modified"},
+		{"unchanged", true, true, false, "unchanged"},
+		// contentDiffers is ignored when only in new
+		{"added ignores differs", false, true, true, "added"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyFileChange(tt.inOld, tt.inNew, tt.contentDiffers)
+			if got != tt.want {
+				t.Fatalf("classifyFileChange(%v, %v, %v) = %q, want %q",
+					tt.inOld, tt.inNew, tt.contentDiffers, got, tt.want)
+			}
+		})
+	}
+}
+
+// --- checkBlobSize tests ---
+
+func TestCheckBlobSizeValid(t *testing.T) {
+	if err := checkBlobSize(100, 100, 1024); err != nil {
+		t.Fatalf("valid size: %v", err)
+	}
+}
+
+func TestCheckBlobSizeExceedsMax(t *testing.T) {
+	err := checkBlobSize(100, 2000, 1024)
+	if err == nil {
+		t.Fatal("expected error for size exceeding max")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("expected exceeds maximum error, got: %v", err)
+	}
+}
+
+func TestCheckBlobSizeMismatch(t *testing.T) {
+	err := checkBlobSize(100, 200, 1024)
+	if err == nil {
+		t.Fatal("expected error for size mismatch")
+	}
+	if !strings.Contains(err.Error(), "data length") {
+		t.Fatalf("expected data length error, got: %v", err)
+	}
+}
+
+func TestCheckBlobSizeAtMax(t *testing.T) {
+	// Exactly at max should pass
+	if err := checkBlobSize(1024, 1024, 1024); err != nil {
+		t.Fatalf("size at max should pass: %v", err)
+	}
+}
+
+// --- Path conflict edge cases ---
+
+func TestPathConflictManyInterveningPaths(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("content"))
+	now := time.Now()
+
+	// "a" conflicts with "a/z.txt", but many paths intervene:
+	// a, a-1, a-2, a.1, a.2, a/z.txt
+	_, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "a", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+		{Path: "a-1", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+		{Path: "a-2", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+		{Path: "a.1", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+		{Path: "a.2", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+		{Path: "a/z.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+	}, "many intervening")
+	if err == nil {
+		t.Fatal("expected error: 'a' and 'a/z.txt' conflict despite 4 intervening paths")
+	}
+	if !strings.Contains(err.Error(), "path conflict") {
+		t.Fatalf("expected path conflict error, got: %v", err)
+	}
+}
+
+func TestPathConflictEmptyList(t *testing.T) {
+	s := testStore(t)
+	// Empty snapshot should work fine
+	_, err := s.CreateSnapshot(nil, []SnapshotFile{}, "empty")
+	if err != nil {
+		t.Fatalf("empty snapshot should succeed: %v", err)
+	}
+}
+
+func TestPathConflictSingleFile(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("content"))
+	now := time.Now()
+
+	_, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "only.txt", BlobHash: h, Mode: 0644, ModTime: now, Size: 7, Type: "file"},
+	}, "single file")
+	if err != nil {
+		t.Fatalf("single file should succeed: %v", err)
+	}
+}
+
+// --- GetBlob raw size mismatch with large size ---
+
+func TestGetBlobRejectsRawSizeLargerThanData(t *testing.T) {
+	s := testStore(t)
+	data := []byte("small data")
+
+	hash, err := s.PutBlob(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set size LARGER than actual data (but within maxBlobSize)
+	_, err = s.db.Exec(`UPDATE blobs SET size = ? WHERE hash = ?`, 1000, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.GetBlob(hash)
+	if err == nil {
+		t.Fatal("expected error for raw blob with oversized stored size")
 	}
 }

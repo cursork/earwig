@@ -1,0 +1,10 @@
+// Gobra stubs for Go encoding/hex package
+
+// +gobra
+
+package hex
+
+// EncodeToString returns the hexadecimal encoding of src.
+ensures len(result) == 2 * len(src)
+decreases _
+func EncodeToString(src []byte) (result string)

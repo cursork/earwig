@@ -1,0 +1,10 @@
+// Gobra stubs for Go fmt package
+
+// +gobra
+
+package fmt
+
+// Errorf formats according to a format specifier and returns an error.
+ensures err != nil && err.ErrorMem()
+decreases _
+func Errorf(format string, a ...interface{}) (err error)

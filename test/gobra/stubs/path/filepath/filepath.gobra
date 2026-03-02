@@ -1,0 +1,34 @@
+// Gobra stubs for Go path/filepath package
+// Gobra does not support rune-to-string conversion, so Separator is modeled
+// as a string. The Go code uses string(filepath.Separator) which Gobra sees
+// as string("/") — a no-op identity on a string — which it can handle.
+
+// +gobra
+
+package filepath
+
+// Separator is the OS-specific path separator.
+// In Go this is a byte, but Gobra can't do string(byte), so we model it as
+// a string. string(Separator) in Go code becomes string("/") which Gobra
+// should accept as a string-to-string identity.
+const Separator = "/"
+
+// IsAbs reports whether the path is absolute.
+decreases
+func IsAbs(path string) bool
+
+// Clean returns the shortest path name equivalent to path.
+ensures len(result) > 0
+decreases
+pure func Clean(path string) (result string)
+
+// Join joins path elements into a single path, separating them with the
+// OS-specific separator.
+ensures len(result) > 0 || (len(parts) == 0)
+decreases _
+func Join(parts ...string) (result string)
+
+// FromSlash returns the result of replacing each slash character in path
+// with the OS-specific separator.
+decreases
+func FromSlash(path string) string
