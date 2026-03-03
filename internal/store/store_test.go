@@ -912,6 +912,47 @@ func TestDeleteSnapshotReparentsToNull(t *testing.T) {
 	}
 }
 
+// --- MaskMode tests ---
+
+func TestMaskModeNormal(t *testing.T) {
+	if got := MaskMode(0o755); got != 0o755 {
+		t.Fatalf("MaskMode(0755) = %04o, want 0755", got)
+	}
+	if got := MaskMode(0o644); got != 0o644 {
+		t.Fatalf("MaskMode(0644) = %04o, want 0644", got)
+	}
+}
+
+func TestMaskModeStripsSetuid(t *testing.T) {
+	if got := MaskMode(0o4755); got != 0o755 {
+		t.Fatalf("MaskMode(04755) = %04o, want 0755", got)
+	}
+}
+
+func TestMaskModeStripsSetgid(t *testing.T) {
+	if got := MaskMode(0o2755); got != 0o755 {
+		t.Fatalf("MaskMode(02755) = %04o, want 0755", got)
+	}
+}
+
+func TestMaskModeStripsSticky(t *testing.T) {
+	if got := MaskMode(0o1755); got != 0o755 {
+		t.Fatalf("MaskMode(01755) = %04o, want 0755", got)
+	}
+}
+
+func TestMaskModeStripsAll(t *testing.T) {
+	if got := MaskMode(0o7777); got != 0o777 {
+		t.Fatalf("MaskMode(07777) = %04o, want 0777", got)
+	}
+}
+
+func TestMaskModeZero(t *testing.T) {
+	if got := MaskMode(0); got != 0 {
+		t.Fatalf("MaskMode(0) = %04o, want 0", got)
+	}
+}
+
 // --- chooseEncoding tests ---
 
 func TestChooseEncodingSmallData(t *testing.T) {

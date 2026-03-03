@@ -2,12 +2,6 @@ package store
 
 import "time"
 
-type Blob struct {
-	Hash string
-	Size int64
-	Data []byte
-}
-
 type Snapshot struct {
 	ID        int64
 	Hash      string

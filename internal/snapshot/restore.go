@@ -128,8 +128,8 @@ func (r *Restorer) Restore(snapshotID int64) error {
 			if h, err := hashFile(absPath); err == nil && h == f.BlobHash {
 				// Content matches — but still fix permissions if they differ
 				if info, err := os.Lstat(absPath); err == nil {
-					if info.Mode().Perm() != os.FileMode(f.Mode).Perm() {
-						if err := os.Chmod(absPath, os.FileMode(f.Mode).Perm()); err != nil {
+					if info.Mode().Perm() != store.MaskMode(f.Mode) {
+						if err := os.Chmod(absPath, store.MaskMode(f.Mode)); err != nil {
 							return fmt.Errorf("fixing permissions on %s: %w", f.Path, err)
 						}
 					}
@@ -155,7 +155,7 @@ func (r *Restorer) Restore(snapshotID int64) error {
 
 		// Mask mode to permission bits only (strip setuid/setgid/sticky
 		// that a crafted DB could set).
-		mode := os.FileMode(f.Mode).Perm()
+		mode := store.MaskMode(f.Mode)
 
 		switch f.Type {
 		case "symlink":
@@ -268,7 +268,7 @@ type ChmodEntry struct {
 
 // HasChanges returns true if the plan includes any filesystem modifications.
 func (p *RestorePlan) HasChanges() bool {
-	return len(p.Delete) > 0 || len(p.Write) > 0 || len(p.Modify) > 0 || len(p.Chmod) > 0
+	return hasChanges(len(p.Delete), len(p.Write), len(p.Modify), len(p.Chmod))
 }
 
 // Preview computes what a restore would do without modifying the filesystem.
@@ -381,11 +381,11 @@ func (r *Restorer) Preview(snapshotID int64) (*RestorePlan, error) {
 		// Content matches — check permissions (only for regular files)
 		if !diskIsLink {
 			info, err := os.Lstat(absPath)
-			if err == nil && info.Mode().Perm() != os.FileMode(f.Mode).Perm() {
+			if err == nil && info.Mode().Perm() != store.MaskMode(f.Mode) {
 				plan.Chmod = append(plan.Chmod, ChmodEntry{
 					Path:    f.Path,
 					OldMode: info.Mode().Perm(),
-					NewMode: os.FileMode(f.Mode).Perm(),
+					NewMode: store.MaskMode(f.Mode),
 				})
 				continue
 			}

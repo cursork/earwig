@@ -76,7 +76,7 @@ func (c *Creator) TakeSnapshot(parentID *int64, message string) (*store.Snapshot
 				Mode:     uint32(info.Mode().Perm()),
 				ModTime:  info.ModTime(),
 				Size:     int64(len(target)),
-				Type:     "symlink",
+				Type:     readSymlinkType(),
 			})
 			return nil
 		}
@@ -253,7 +253,7 @@ func (c *Creator) readFile(absPath, relPath string) (store.SnapshotFile, error) 
 		Mode:     uint32(info.Mode().Perm()),
 		ModTime:  info.ModTime(),
 		Size:     info.Size(),
-		Type:     "file",
+		Type:     readFileType(),
 	}, nil
 }
 
@@ -280,7 +280,7 @@ func (c *Creator) readSymlink(absPath, relPath string) (store.SnapshotFile, erro
 		Mode:     uint32(info.Mode().Perm()),
 		ModTime:  info.ModTime(),
 		Size:     int64(len(target)),
-		Type:     "symlink",
+		Type:     readSymlinkType(),
 	}, nil
 }
 
