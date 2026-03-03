@@ -238,10 +238,14 @@ func splitPath(path string) []string {
 	var parts []string
 	for path != "" && path != "." {
 		dir, file := filepath.Split(path)
-		if file != "" {
+		if file != "" && file != "." {
 			parts = append(parts, file)
 		}
-		path = filepath.Clean(dir)
+		cleaned := filepath.Clean(dir)
+		if cleaned == path {
+			break // reached filesystem root (e.g. "/"), avoid infinite loop
+		}
+		path = cleaned
 	}
 	// Reverse to get root-to-leaf order
 	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
