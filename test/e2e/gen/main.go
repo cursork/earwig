@@ -277,9 +277,10 @@ func (h *Harness) opChmod() {
 		h.fatalf("Chmod %s: %v", absPath, err)
 	}
 
+	oldMode := entry.Mode
 	entry.Mode = newMode
 	h.model.files[path] = entry
-	fmt.Printf("  chmod %s %04o -> %04o\n", path, entry.Mode, newMode)
+	fmt.Printf("  chmod %s %04o -> %04o\n", path, oldMode, newMode)
 }
 
 func (h *Harness) opCreateSymlink() {
@@ -322,13 +323,21 @@ func (h *Harness) opDeleteFile() {
 	path := existing[h.rng.Intn(len(existing))]
 
 	absPath := filepath.Join(h.dir, path)
-	// Ensure parent is writable and file is removable
-	os.Chmod(filepath.Dir(absPath), 0755)
+	// Ensure parent is writable and file is removable.
+	// Save and restore parent dir mode in case earwig ever tracks directories.
+	parentDir := filepath.Dir(absPath)
+	parentInfo, parentErr := os.Lstat(parentDir)
+	if parentErr == nil {
+		os.Chmod(parentDir, 0755)
+	}
 	if info, err := os.Lstat(absPath); err == nil && info.Mode()&os.ModeSymlink == 0 {
 		os.Chmod(absPath, 0644) // ensure writable (only for regular files)
 	}
 	if err := os.Remove(absPath); err != nil {
 		h.fatalf("Remove %s: %v", absPath, err)
+	}
+	if parentErr == nil {
+		os.Chmod(parentDir, parentInfo.Mode().Perm())
 	}
 	delete(h.model.files, path)
 
