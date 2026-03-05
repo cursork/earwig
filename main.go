@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -577,6 +578,16 @@ func acquireFlock(root string, blocking bool) (*os.File, error) {
 }
 
 func cmdWatch(args []string) error {
+	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
+	detach := fs.Bool("detach", false, "run watcher in background (survives terminal close)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *detach {
+		return detachWatcher()
+	}
+
 	s, root, err := openStore()
 	if err != nil {
 		return err
@@ -666,8 +677,59 @@ func cmdWatch(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Clean up PID file on shutdown (best-effort, may not exist)
+	defer os.Remove(filepath.Join(root, ".earwig", "PID"))
+
 	fmt.Printf("Watching %s for changes (Ctrl+C to stop)\n", root)
 	return w.Run(ctx)
+}
+
+func detachWatcher() error {
+	root, err := findRoot()
+	if err != nil {
+		return err
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("finding executable path: %w", err)
+	}
+
+	logPath := filepath.Join(root, ".earwig", "watch.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("opening log file: %w", err)
+	}
+
+	cmd := &exec.Cmd{
+		Path:   exe,
+		Args:   []string{exe, "watch"},
+		Dir:    root,
+		Stdout: logFile,
+		Stderr: logFile,
+		SysProcAttr: &syscall.SysProcAttr{
+			Setsid: true,
+		},
+	}
+
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return fmt.Errorf("starting watcher: %w", err)
+	}
+	logFile.Close()
+
+	pid := cmd.Process.Pid
+
+	// Release the child process so the parent doesn't wait/zombie
+	cmd.Process.Release()
+
+	pidPath := filepath.Join(root, ".earwig", "PID")
+	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", pid)), 0644); err != nil {
+		return fmt.Errorf("writing PID file: %w", err)
+	}
+
+	fmt.Printf("Watcher started (PID %d), logging to .earwig/watch.log\n", pid)
+	return nil
 }
 
 func cmdRestore(args []string) error {
