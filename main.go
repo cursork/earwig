@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -33,7 +34,8 @@ var commands = map[string]func([]string) error{
 	"diff":     cmdDiff,
 	"gc":       cmdGC,
 	"forget":   cmdForget,
-	"_files":   cmdFiles,
+	"processes": cmdProcesses,
+	"_files":    cmdFiles,
 }
 
 func main() {
@@ -980,4 +982,69 @@ func cmdGC(args []string) error {
 		fmt.Printf("Removed %d orphaned blob(s).\n", count)
 	}
 	return nil
+}
+
+func cmdProcesses(args []string) error {
+	out, err := exec.Command("ps", "-eo", "pid,etime,args").Output()
+	if err != nil {
+		return fmt.Errorf("running ps: %w", err)
+	}
+
+	myPID := os.Getpid()
+	found := false
+
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.Contains(line, "earwig") || !strings.Contains(line, "watch") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		var pid int
+		if _, err := fmt.Sscanf(fields[0], "%d", &pid); err != nil {
+			continue
+		}
+		if pid == myPID {
+			continue
+		}
+
+		dir := processCwd(pid)
+		if !found {
+			found = true
+		}
+		if dir != "" {
+			fmt.Printf("PID %-8d  %-14s  %s\n", pid, fields[1], dir)
+		} else {
+			fmt.Printf("PID %-8d  %-14s  (unknown directory)\n", pid, fields[1])
+		}
+	}
+
+	if !found {
+		fmt.Println("No earwig watchers running.")
+	}
+	return nil
+}
+
+func processCwd(pid int) string {
+	if runtime.GOOS == "linux" {
+		target, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))
+		if err != nil {
+			return ""
+		}
+		return target
+	}
+	// macOS: use lsof
+	out, err := exec.Command("lsof", "-a", "-p", fmt.Sprintf("%d", pid), "-d", "cwd", "-Fn").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "n") {
+			return line[1:]
+		}
+	}
+	return ""
 }
