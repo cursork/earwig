@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pmezard/go-difflib/difflib"
+
 	"github.com/nk/earwig/internal/ignore"
 	"github.com/nk/earwig/internal/snapshot"
 	"github.com/nk/earwig/internal/store"
@@ -861,8 +863,137 @@ func cmdDiff(args []string) error {
 		return nil
 	}
 
+	// Build map of snapshot files for blob lookups
+	targetFiles, err := s.GetSnapshotFiles(snap.ID)
+	if err != nil {
+		return err
+	}
+	targetMap := make(map[string]store.SnapshotFile, len(targetFiles))
+	for _, f := range targetFiles {
+		targetMap[f.Path] = f
+	}
+
+	// A/M/D summary at the top
 	printPlan(plan, snap)
+
+	// Diffs
+	for _, path := range plan.Delete {
+		old, oldLabel := readDiskContent(root, path)
+		printUnifiedDiff(old, "", "a/"+path, "/dev/null", oldLabel, "")
+	}
+
+	for _, path := range plan.Write {
+		f, ok := targetMap[path]
+		if !ok {
+			continue
+		}
+		nw, newLabel := readBlobContent(s, f)
+		printUnifiedDiff("", nw, "/dev/null", "b/"+path, "", newLabel)
+	}
+
+	for _, path := range plan.Modify {
+		f, ok := targetMap[path]
+		if !ok {
+			continue
+		}
+		old, oldLabel := readDiskContent(root, path)
+		nw, newLabel := readBlobContent(s, f)
+		printUnifiedDiff(old, nw, "a/"+path, "b/"+path, oldLabel, newLabel)
+	}
+
 	return nil
+}
+
+// readDiskContent reads the current content of a file on disk.
+// Returns the content string and a label hint (e.g. "(binary)" or "(symlink)").
+func readDiskContent(root, relPath string) (string, string) {
+	absPath := filepath.Join(root, filepath.FromSlash(relPath))
+	info, err := os.Lstat(absPath)
+	if err != nil {
+		return "", ""
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(absPath)
+		if err != nil {
+			return "", ""
+		}
+		return target + "\n", "(symlink)"
+	}
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return "", ""
+	}
+	if isBinaryContent(data) {
+		return "", "(binary)"
+	}
+	return string(data), ""
+}
+
+// readBlobContent reads content from the blob store for a snapshot file.
+func readBlobContent(s *store.Store, f store.SnapshotFile) (string, string) {
+	data, err := s.GetBlob(f.BlobHash)
+	if err != nil {
+		return "", ""
+	}
+	if f.Type == "symlink" {
+		return string(data) + "\n", "(symlink)"
+	}
+	if isBinaryContent(data) {
+		return "", "(binary)"
+	}
+	return string(data), ""
+}
+
+// isBinaryContent returns true if data contains NUL bytes (indicating binary).
+func isBinaryContent(data []byte) bool {
+	// Check up to first 8KB
+	limit := len(data)
+	if limit > 8192 {
+		limit = 8192
+	}
+	for i := 0; i < limit; i++ {
+		if data[i] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// printUnifiedDiff prints a unified diff between old and new content.
+func printUnifiedDiff(oldContent, newContent, oldName, newName, oldLabel, newLabel string) {
+	// Binary file detection
+	if oldLabel == "(binary)" || newLabel == "(binary)" {
+		name := strings.TrimPrefix(oldName, "a/")
+		if name == "/dev/null" {
+			name = strings.TrimPrefix(newName, "b/")
+		}
+		fmt.Printf("Binary file %s differs\n", name)
+		return
+	}
+
+	// Symlink annotation
+	if oldLabel == "(symlink)" {
+		oldName += " " + oldLabel
+	}
+	if newLabel == "(symlink)" {
+		newName += " " + newLabel
+	}
+
+	diff := difflib.UnifiedDiff{
+		A:        difflib.SplitLines(oldContent),
+		B:        difflib.SplitLines(newContent),
+		FromFile: oldName,
+		ToFile:   newName,
+		Context:  3,
+	}
+	text, err := difflib.GetUnifiedDiffString(diff)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: diff failed for %s: %v\n", oldName, err)
+		return
+	}
+	if text != "" {
+		fmt.Print(text)
+	}
 }
 
 func printPlan(plan *snapshot.RestorePlan, snap *store.Snapshot) {

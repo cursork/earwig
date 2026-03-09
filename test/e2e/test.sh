@@ -1191,7 +1191,7 @@ snapshot                                        # snapshot #2
 expect_snapshot_count 2
 
 # =========================================================
-# TEST 34: earwig diff command
+# TEST 34: earwig diff command — unified diff output
 # =========================================================
 blue "=== TEST 34: earwig diff ==="
 
@@ -1206,25 +1206,82 @@ write_file "a.txt" "changed"
 delete_file "b.txt"
 write_file "c.txt" "new"
 
-# diff should show the changes without modifying anything
+# diff should show A/M/D summary then unified diffs
 diff_output=$(earwig diff "${SNAPSHOTS[0]}" 2>&1)
 
+# Summary at the top
 if echo "$diff_output" | grep -q "A b.txt"; then
-    pass "diff shows b.txt would be written (restored)"
+    pass "diff summary shows A b.txt"
 else
-    fail "diff shows b.txt would be written" "output: $diff_output"
+    fail "diff summary shows A b.txt" "output: $diff_output"
 fi
-
 if echo "$diff_output" | grep -q "D c.txt"; then
-    pass "diff shows c.txt would be deleted"
+    pass "diff summary shows D c.txt"
 else
-    fail "diff shows c.txt would be deleted" "output: $diff_output"
+    fail "diff summary shows D c.txt" "output: $diff_output"
+fi
+if echo "$diff_output" | grep -q "M a.txt"; then
+    pass "diff summary shows M a.txt"
+else
+    fail "diff summary shows M a.txt" "output: $diff_output"
 fi
 
-if echo "$diff_output" | grep -q "M a.txt"; then
-    pass "diff shows a.txt would be modified"
+# Deleted file (c.txt: on disk but not in snapshot)
+if echo "$diff_output" | grep -q "^--- a/c.txt"; then
+    pass "diff deleted file has --- a/ header"
 else
-    fail "diff shows a.txt would be modified" "output: $diff_output"
+    fail "diff deleted file has --- a/ header" "output: $diff_output"
+fi
+if echo "$diff_output" | grep -q "^+++ /dev/null"; then
+    pass "diff deleted file has +++ /dev/null"
+else
+    fail "diff deleted file has +++ /dev/null" "output: $diff_output"
+fi
+if echo "$diff_output" | grep -q "^-new"; then
+    pass "diff deleted file shows removed content"
+else
+    fail "diff deleted file shows removed content" "output: $diff_output"
+fi
+
+# New file (b.txt: in snapshot but not on disk)
+if echo "$diff_output" | grep -q "^+++ b/b.txt"; then
+    pass "diff new file has +++ b/ header"
+else
+    fail "diff new file has +++ b/ header" "output: $diff_output"
+fi
+if echo "$diff_output" | grep -q "^+world"; then
+    pass "diff new file shows added content"
+else
+    fail "diff new file shows added content" "output: $diff_output"
+fi
+
+# Modified file (a.txt: content differs)
+if echo "$diff_output" | grep -q "^--- a/a.txt"; then
+    pass "diff modified file has --- a/ header"
+else
+    fail "diff modified file has --- a/ header" "output: $diff_output"
+fi
+if echo "$diff_output" | grep -q "^+++ b/a.txt"; then
+    pass "diff modified file has +++ b/ header"
+else
+    fail "diff modified file has +++ b/ header" "output: $diff_output"
+fi
+if echo "$diff_output" | grep -q "^-changed"; then
+    pass "diff modified file shows old content"
+else
+    fail "diff modified file shows old content" "output: $diff_output"
+fi
+if echo "$diff_output" | grep -q "^+hello"; then
+    pass "diff modified file shows new content"
+else
+    fail "diff modified file shows new content" "output: $diff_output"
+fi
+
+# Has hunk headers
+if echo "$diff_output" | grep -q "^@@"; then
+    pass "diff output contains hunk headers"
+else
+    fail "diff output contains hunk headers" "output: $diff_output"
 fi
 
 # Verify diff is read-only: filesystem unchanged
@@ -1503,6 +1560,182 @@ if echo "$restore_output" | grep -qi "unknown blob encoding"; then
     pass "invalid blob encoding rejected on restore"
 else
     fail "invalid blob encoding rejected" "output: $restore_output"
+fi
+
+# =========================================================
+# TEST 44: diff with binary files
+# =========================================================
+blue "=== TEST 44: diff binary files ==="
+
+init_project /tmp/earwig-test-44
+
+printf '\x00\x01\x02\x03binary' > bin.dat
+printf 'text content\n' > text.txt
+earwig snapshot > /dev/null
+SNAPSHOTS+=($(earwig log | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
+
+# Modify both files
+printf '\x00\x01\x02\x03CHANGED' > bin.dat
+printf 'text modified\n' > text.txt
+
+diff_output=$(earwig diff "${SNAPSHOTS[0]}" 2>&1)
+
+if echo "$diff_output" | grep -q "Binary file bin.dat differs"; then
+    pass "diff binary file shows 'Binary file differs'"
+else
+    fail "diff binary file shows 'Binary file differs'" "output: $diff_output"
+fi
+
+# Text file still gets a real diff
+if echo "$diff_output" | grep -q "^-text modified"; then
+    pass "diff text file shows unified diff alongside binary"
+else
+    fail "diff text file shows unified diff alongside binary" "output: $diff_output"
+fi
+
+# New binary file on disk (not in snapshot — would be deleted)
+printf '\x00\x01new-binary' > new-bin.dat
+
+diff_output2=$(earwig diff "${SNAPSHOTS[0]}" 2>&1)
+if echo "$diff_output2" | grep -q "Binary file new-bin.dat differs"; then
+    pass "diff detects binary in deleted file"
+else
+    fail "diff detects binary in deleted file" "output: $diff_output2"
+fi
+
+# Binary in blob store (delete binary from disk — restore would recreate it)
+rm bin.dat
+diff_output3=$(earwig diff "${SNAPSHOTS[0]}" 2>&1)
+if echo "$diff_output3" | grep -q "Binary file bin.dat differs"; then
+    pass "diff detects binary in blob store (new file)"
+else
+    fail "diff detects binary in blob store (new file)" "output: $diff_output3"
+fi
+
+# =========================================================
+# TEST 45: diff with symlinks
+# =========================================================
+blue "=== TEST 45: diff symlinks ==="
+
+init_project /tmp/earwig-test-45
+
+printf 'target content\n' > target.txt
+ln -s target.txt link.txt
+earwig snapshot > /dev/null
+SNAPSHOTS+=($(earwig log | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
+
+# Change symlink target
+rm link.txt
+ln -s /tmp/other link.txt
+
+diff_output=$(earwig diff "${SNAPSHOTS[0]}" 2>&1)
+
+# Should show (symlink) labels
+if echo "$diff_output" | grep -q "(symlink)"; then
+    pass "diff symlink shows (symlink) label"
+else
+    fail "diff symlink shows (symlink) label" "output: $diff_output"
+fi
+
+# Should show old and new targets
+if echo "$diff_output" | grep -q "target.txt"; then
+    pass "diff symlink shows original target"
+else
+    fail "diff symlink shows original target" "output: $diff_output"
+fi
+
+# Deleted symlink (remove from disk — restore would recreate it)
+rm link.txt
+diff_output2=$(earwig diff "${SNAPSHOTS[0]}" 2>&1)
+if echo "$diff_output2" | grep -q "(symlink)"; then
+    pass "diff new symlink from blob shows (symlink) label"
+else
+    fail "diff new symlink from blob shows (symlink) label" "output: $diff_output2"
+fi
+
+# New symlink on disk (not in snapshot — would be deleted)
+ln -s /tmp/whatever extra-link.txt
+diff_output3=$(earwig diff "${SNAPSHOTS[0]}" 2>&1)
+if echo "$diff_output3" | grep -q "extra-link.txt"; then
+    pass "diff deleted symlink appears in output"
+else
+    fail "diff deleted symlink appears in output" "output: $diff_output3"
+fi
+
+# =========================================================
+# TEST 46: diff with chmod-only changes
+# =========================================================
+blue "=== TEST 46: diff chmod-only ==="
+
+init_project /tmp/earwig-test-46
+
+printf 'some content\n' > script.sh
+chmod 755 script.sh
+earwig snapshot > /dev/null
+SNAPSHOTS+=($(earwig log | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
+
+# Change only permissions, not content
+chmod 644 script.sh
+
+diff_output=$(earwig diff "${SNAPSHOTS[0]}" 2>&1)
+
+# Should show chmod entry in summary
+if echo "$diff_output" | grep -q "C script.sh"; then
+    pass "diff chmod-only shows chmod entry"
+else
+    fail "diff chmod-only shows chmod entry" "output: $diff_output"
+fi
+
+# Should show the mode values
+if echo "$diff_output" | grep -q "0644.*0755"; then
+    pass "diff chmod-only shows old and new modes"
+else
+    fail "diff chmod-only shows old and new modes" "output: $diff_output"
+fi
+
+# Should NOT contain unified diff markers (no content changed)
+if echo "$diff_output" | grep -q "^---"; then
+    fail "diff chmod-only has no unified diff headers" "output: $diff_output"
+else
+    pass "diff chmod-only has no unified diff headers"
+fi
+
+# =========================================================
+# TEST 47: diff with file-to-symlink type change
+# =========================================================
+blue "=== TEST 47: diff type change ==="
+
+init_project /tmp/earwig-test-47
+
+printf 'real content\n' > target.txt
+earwig snapshot > /dev/null
+SNAPSHOTS+=($(earwig log | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
+
+# Replace file with symlink
+rm target.txt
+ln -s /tmp/elsewhere target.txt
+
+diff_output=$(earwig diff "${SNAPSHOTS[0]}" 2>&1)
+
+# Should show as modified (type change)
+if echo "$diff_output" | grep -q "M target.txt"; then
+    pass "diff type change shows M in summary"
+else
+    fail "diff type change shows M in summary" "output: $diff_output"
+fi
+
+# One side should be (symlink), other should be plain
+if echo "$diff_output" | grep -q "(symlink)"; then
+    pass "diff type change shows (symlink) label"
+else
+    fail "diff type change shows (symlink) label" "output: $diff_output"
+fi
+
+# Should show the original file content being restored
+if echo "$diff_output" | grep -q "real content"; then
+    pass "diff type change shows file content"
+else
+    fail "diff type change shows file content" "output: $diff_output"
 fi
 
 # =========================================================
