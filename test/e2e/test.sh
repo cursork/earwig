@@ -1739,6 +1739,108 @@ else
 fi
 
 # =========================================================
+# TEST 48: earwig show <hash> <file>
+# =========================================================
+blue "=== TEST 48: show file contents ==="
+
+init_project /tmp/earwig-test-48
+
+write_file "a.txt" "alpha"
+write_file "sub/b.txt" "beta"
+snapshot                                        # snapshot #1
+
+# Modify files, snapshot again
+write_file "a.txt" "alpha-v2"
+snapshot                                        # snapshot #2
+
+# Show single file from old snapshot
+show_output=$(earwig show "${SNAPSHOTS[0]}" a.txt)
+if [ "$show_output" = "alpha" ]; then
+    pass "show file retrieves content from snapshot"
+else
+    fail "show file retrieves content from snapshot" "got: $show_output"
+fi
+
+# Show file from newer snapshot
+show_output2=$(earwig show "${SNAPSHOTS[1]}" a.txt)
+if [ "$show_output2" = "alpha-v2" ]; then
+    pass "show file retrieves updated content"
+else
+    fail "show file retrieves updated content" "got: $show_output2"
+fi
+
+# Show multiple files
+show_multi=$(earwig show "${SNAPSHOTS[0]}" a.txt sub/b.txt)
+if echo "$show_multi" | grep -q "==> a.txt <=="; then
+    pass "show multiple files has headers"
+else
+    fail "show multiple files has headers" "got: $show_multi"
+fi
+if echo "$show_multi" | grep -q "alpha"; then
+    pass "show multiple files includes first file content"
+else
+    fail "show multiple files includes first file content" "got: $show_multi"
+fi
+if echo "$show_multi" | grep -q "beta"; then
+    pass "show multiple files includes second file content"
+else
+    fail "show multiple files includes second file content" "got: $show_multi"
+fi
+
+# Show symlink (should print the link target, not followed content)
+ln -s sub/b.txt link.txt
+earwig snapshot > /dev/null
+SNAPSHOTS+=($(earwig log | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
+show_link=$(earwig show "${SNAPSHOTS[2]}" link.txt)
+if [ "$show_link" = "sub/b.txt" ]; then
+    pass "show symlink prints link target"
+else
+    fail "show symlink prints link target" "got: $show_link"
+fi
+
+# Missing file
+show_err=$(earwig show "${SNAPSHOTS[0]}" nope.txt 2>&1 || true)
+if echo "$show_err" | grep -q "not found"; then
+    pass "show missing file returns error"
+else
+    fail "show missing file returns error" "got: $show_err"
+fi
+
+# =========================================================
+# TEST 49: earwig db
+# =========================================================
+blue "=== TEST 49: earwig db ==="
+
+init_project /tmp/earwig-test-49
+
+write_file "a.txt" "hello"
+snapshot
+
+# Non-interactive query
+db_output=$(earwig db "SELECT count(*) FROM snapshots")
+if [ "$db_output" = "1" ]; then
+    pass "db query returns correct result"
+else
+    fail "db query returns correct result" "got: $db_output"
+fi
+
+# Query snapshot_files
+db_files=$(earwig db "SELECT path FROM snapshot_files ORDER BY path")
+if [ "$db_files" = "a.txt" ]; then
+    pass "db query can read snapshot_files"
+else
+    fail "db query can read snapshot_files" "got: $db_files"
+fi
+
+# Dot commands work
+db_tables=$(earwig db ".tables")
+if echo "$db_tables" | grep -q "snapshots"; then
+    pass "db dot-commands work"
+else
+    fail "db dot-commands work" "got: $db_tables"
+fi
+
+# =========================================================
 # DONE
 # =========================================================
 summary

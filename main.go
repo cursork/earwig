@@ -37,6 +37,7 @@ var commands = map[string]func([]string) error{
 	"gc":       cmdGC,
 	"forget":   cmdForget,
 	"processes": cmdProcesses,
+	"db":        cmdDB,
 	"_files":    cmdFiles,
 }
 
@@ -432,7 +433,7 @@ func changeSummaryFor(s *store.Store, snap *store.Snapshot) string {
 
 func cmdShow(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: earwig show <hash>")
+		return fmt.Errorf("usage: earwig show <hash> [file ...]")
 	}
 
 	s, _, err := openStore()
@@ -446,6 +447,12 @@ func cmdShow(args []string) error {
 		return err
 	}
 
+	// earwig show <hash> <file> [file ...] — print file contents
+	if len(args) > 1 {
+		return showFiles(s, snap, args[1:])
+	}
+
+	// earwig show <hash> — summary
 	fmt.Printf("Snapshot %s\n", shortHash(snap.Hash))
 	fmt.Printf("Date:    %s\n", snap.CreatedAt.Format("2006-01-02 15:04:05"))
 	fmt.Printf("Message: %s\n\n", snap.Message)
@@ -484,6 +491,38 @@ func cmdShow(args []string) error {
 	return nil
 }
 
+func showFiles(s *store.Store, snap *store.Snapshot, paths []string) error {
+	files, err := s.GetSnapshotFiles(snap.ID)
+	if err != nil {
+		return err
+	}
+	fileMap := make(map[string]store.SnapshotFile, len(files))
+	for _, f := range files {
+		fileMap[f.Path] = f
+	}
+
+	multi := len(paths) > 1
+	for i, path := range paths {
+		path = filepath.ToSlash(path)
+		f, ok := fileMap[path]
+		if !ok {
+			return fmt.Errorf("file not found in snapshot: %s", path)
+		}
+		data, err := s.GetBlob(f.BlobHash)
+		if err != nil {
+			return err
+		}
+		if multi && i > 0 {
+			fmt.Println()
+		}
+		if multi {
+			fmt.Printf("==> %s <==\n", path)
+		}
+		os.Stdout.Write(data)
+	}
+	return nil
+}
+
 func cmdFiles(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: earwig _files <hash>")
@@ -509,6 +548,30 @@ func cmdFiles(args []string) error {
 		fmt.Printf("%s\t%d\t%s\t%s\n", f.Path, f.Size, f.BlobHash, f.Type)
 	}
 	return nil
+}
+
+func cmdDB(args []string) error {
+	root, err := findRoot()
+	if err != nil {
+		return err
+	}
+	dbPath := filepath.Join(root, ".earwig", "earwig.db")
+
+	sqlite3, err := exec.LookPath("sqlite3")
+	if err != nil {
+		return fmt.Errorf("sqlite3 not found in PATH")
+	}
+
+	if len(args) == 0 {
+		// Interactive: exec sqlite3 (replaces process)
+		return syscall.Exec(sqlite3, []string{"sqlite3", dbPath}, os.Environ())
+	}
+
+	// Non-interactive: run query
+	cmd := exec.Command(sqlite3, dbPath, strings.Join(args, " "))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // HEAD tracking
