@@ -12,7 +12,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -68,18 +67,21 @@ func shortHash(hash string) string {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: earwig <command> [args]\n\nCommands:\n")
-	names := make([]string, 0, len(commands))
-	for name := range commands {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if strings.HasPrefix(name, "_") {
-			continue
-		}
-		fmt.Fprintf(os.Stderr, "  %s\n", name)
-	}
+	fmt.Fprintf(os.Stderr, `usage: earwig <command> [args]
+
+Commands:
+  init                    Create .earwig/ and database
+  watch [-detach]         Watch for changes and auto-snapshot
+  snapshot                Take a manual snapshot
+  log [file]              Show snapshot history (optionally filter by file)
+  show <hash> [file...]   Show changes in a snapshot, or print file contents
+  diff <hash>             Show what a restore would change vs current state
+  restore [-y] <hash>     Restore filesystem to a snapshot
+  forget <hash>           Delete a snapshot (re-parents children, runs GC)
+  gc                      Remove orphaned blobs
+  processes               List running earwig watchers
+  db [sql]                Open SQLite shell, or run a query
+`)
 }
 
 // findRoot walks up from cwd looking for .earwig/
@@ -229,6 +231,12 @@ func cmdLog(args []string) error {
 		return err
 	}
 
+	// File filter mode: earwig log <file>
+	if len(args) > 0 {
+		filterPath := filepath.ToSlash(args[0])
+		return cmdLogFiltered(s, snapshots, headID, filterPath)
+	}
+
 	// Graph state: each column tracks which snapshot ID it's tracing toward.
 	// 0 means the slot is free.
 	var columns []int64
@@ -330,6 +338,66 @@ func cmdLog(args []string) error {
 		}
 	}
 	return nil
+}
+
+// cmdLogFiltered shows a flat list of snapshots that changed the given file.
+func cmdLogFiltered(s *store.Store, snapshots []store.Snapshot, headID *int64, filterPath string) error {
+	found := false
+	// Process newest-first
+	for i := len(snapshots) - 1; i >= 0; i-- {
+		snap := snapshots[i]
+
+		if !snapshotTouchesFile(s, &snap, filterPath) {
+			continue
+		}
+		found = true
+
+		headMark := ""
+		if headID != nil && snap.ID == *headID {
+			headMark = "  <- HERE"
+		}
+
+		changeSummary := changeSummaryFor(s, &snap)
+
+		fmt.Printf("* %s  %s  %s%s%s\n",
+			shortHash(snap.Hash),
+			snap.CreatedAt.Format("2006-01-02 15:04:05"),
+			snap.Message,
+			changeSummary,
+			headMark,
+		)
+	}
+	if !found {
+		fmt.Printf("No snapshots touching %s\n", filterPath)
+	}
+	return nil
+}
+
+// snapshotTouchesFile returns true if the snapshot added, modified, or deleted the given file.
+func snapshotTouchesFile(s *store.Store, snap *store.Snapshot, path string) bool {
+	if snap.ParentID == nil {
+		// Root snapshot — file is touched if it exists in the snapshot
+		files, err := s.GetSnapshotFiles(snap.ID)
+		if err != nil {
+			return false
+		}
+		for _, f := range files {
+			if f.Path == path {
+				return true
+			}
+		}
+		return false
+	}
+	changes, err := s.DiffSnapshots(*snap.ParentID, snap.ID)
+	if err != nil {
+		return false
+	}
+	for _, c := range changes {
+		if c.Path == path {
+			return true
+		}
+	}
+	return false
 }
 
 // drawGraphPrefix builds the "* | | " prefix for a commit line.
