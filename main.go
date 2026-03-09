@@ -35,6 +35,7 @@ var commands = map[string]func([]string) error{
 	"diff":     cmdDiff,
 	"gc":       cmdGC,
 	"forget":   cmdForget,
+	"tui":       cmdTUI,
 	"processes": cmdProcesses,
 	"db":        cmdDB,
 	"_files":    cmdFiles,
@@ -79,6 +80,7 @@ Commands:
   restore [-y] <hash>     Restore filesystem to a snapshot
   forget <hash>           Delete a snapshot (re-parents children, runs GC)
   gc                      Remove orphaned blobs
+  tui                     Interactive snapshot browser
   processes               List running earwig watchers
   db [sql]                Open SQLite shell, or run a query
 `)
@@ -983,34 +985,42 @@ func cmdDiff(args []string) error {
 		return err
 	}
 
-	restorer := snapshot.NewRestorer(s, root, ig)
-	plan, err := restorer.Preview(snap.ID)
+	result, err := formatRestoreDiffStr(s, root, ig, snap)
 	if err != nil {
 		return err
 	}
+	fmt.Print(result)
+	return nil
+}
+
+// formatRestoreDiffStr returns the full diff of a snapshot vs current filesystem.
+func formatRestoreDiffStr(s *store.Store, root string, ig *ignore.Matcher, snap *store.Snapshot) (string, error) {
+	restorer := snapshot.NewRestorer(s, root, ig)
+	plan, err := restorer.Preview(snap.ID)
+	if err != nil {
+		return "", err
+	}
 
 	if !plan.HasChanges() {
-		fmt.Println("No differences. Current state matches snapshot.")
-		return nil
+		return "No differences. Current state matches snapshot.\n", nil
 	}
 
 	// Build map of snapshot files for blob lookups
 	targetFiles, err := s.GetSnapshotFiles(snap.ID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	targetMap := make(map[string]store.SnapshotFile, len(targetFiles))
 	for _, f := range targetFiles {
 		targetMap[f.Path] = f
 	}
 
-	// A/M/D summary at the top
-	printPlan(plan, snap)
+	var b strings.Builder
+	b.WriteString(formatPlan(plan, snap))
 
-	// Diffs
 	for _, path := range plan.Delete {
 		old, oldLabel := readDiskContent(root, path)
-		printUnifiedDiff(old, "", "a/"+path, "/dev/null", oldLabel, "")
+		b.WriteString(formatUnifiedDiff(old, "", "a/"+path, "/dev/null", oldLabel, ""))
 	}
 
 	for _, path := range plan.Write {
@@ -1019,7 +1029,7 @@ func cmdDiff(args []string) error {
 			continue
 		}
 		nw, newLabel := readBlobContent(s, f)
-		printUnifiedDiff("", nw, "/dev/null", "b/"+path, "", newLabel)
+		b.WriteString(formatUnifiedDiff("", nw, "/dev/null", "b/"+path, "", newLabel))
 	}
 
 	for _, path := range plan.Modify {
@@ -1029,10 +1039,99 @@ func cmdDiff(args []string) error {
 		}
 		old, oldLabel := readDiskContent(root, path)
 		nw, newLabel := readBlobContent(s, f)
-		printUnifiedDiff(old, nw, "a/"+path, "b/"+path, oldLabel, newLabel)
+		b.WriteString(formatUnifiedDiff(old, nw, "a/"+path, "b/"+path, oldLabel, newLabel))
 	}
 
-	return nil
+	return b.String(), nil
+}
+
+// formatParentDiffStr returns the full diff of a snapshot vs its parent.
+func formatParentDiffStr(s *store.Store, snap *store.Snapshot) (string, error) {
+	if snap.ParentID == nil {
+		// Root snapshot: all files are added
+		files, err := s.GetSnapshotFiles(snap.ID)
+		if err != nil {
+			return "", err
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "Snapshot %s (root):\n\n", shortHash(snap.Hash))
+		for _, f := range files {
+			fmt.Fprintf(&b, "  A %s\n", f.Path)
+		}
+		b.WriteByte('\n')
+		for _, f := range files {
+			nw, newLabel := readBlobContent(s, f)
+			b.WriteString(formatUnifiedDiff("", nw, "/dev/null", "b/"+f.Path, "", newLabel))
+		}
+		return b.String(), nil
+	}
+
+	changes, err := s.DiffSnapshots(*snap.ParentID, snap.ID)
+	if err != nil {
+		return "", err
+	}
+
+	if len(changes) == 0 {
+		return "No changes vs parent.\n", nil
+	}
+
+	parentFiles, err := s.GetSnapshotFiles(*snap.ParentID)
+	if err != nil {
+		return "", err
+	}
+	parentMap := make(map[string]store.SnapshotFile, len(parentFiles))
+	for _, f := range parentFiles {
+		parentMap[f.Path] = f
+	}
+
+	snapFiles, err := s.GetSnapshotFiles(snap.ID)
+	if err != nil {
+		return "", err
+	}
+	snapMap := make(map[string]store.SnapshotFile, len(snapFiles))
+	for _, f := range snapFiles {
+		snapMap[f.Path] = f
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Changes in %s vs parent:\n\n", shortHash(snap.Hash))
+
+	for _, c := range changes {
+		switch c.Type {
+		case store.ChangeAdded:
+			fmt.Fprintf(&b, "  A %s\n", c.Path)
+		case store.ChangeModified:
+			fmt.Fprintf(&b, "  M %s\n", c.Path)
+		case store.ChangeDeleted:
+			fmt.Fprintf(&b, "  D %s\n", c.Path)
+		}
+	}
+	b.WriteByte('\n')
+
+	for _, c := range changes {
+		switch c.Type {
+		case store.ChangeDeleted:
+			if f, ok := parentMap[c.Path]; ok {
+				old, oldLabel := readBlobContent(s, f)
+				b.WriteString(formatUnifiedDiff(old, "", "a/"+c.Path, "/dev/null", oldLabel, ""))
+			}
+		case store.ChangeAdded:
+			if f, ok := snapMap[c.Path]; ok {
+				nw, newLabel := readBlobContent(s, f)
+				b.WriteString(formatUnifiedDiff("", nw, "/dev/null", "b/"+c.Path, "", newLabel))
+			}
+		case store.ChangeModified:
+			oldF, okOld := parentMap[c.Path]
+			newF, okNew := snapMap[c.Path]
+			if okOld && okNew {
+				old, oldLabel := readBlobContent(s, oldF)
+				nw, newLabel := readBlobContent(s, newF)
+				b.WriteString(formatUnifiedDiff(old, nw, "a/"+c.Path, "b/"+c.Path, oldLabel, newLabel))
+			}
+		}
+	}
+
+	return b.String(), nil
 }
 
 // readDiskContent reads the current content of a file on disk.
@@ -1090,16 +1189,15 @@ func isBinaryContent(data []byte) bool {
 	return false
 }
 
-// printUnifiedDiff prints a unified diff between old and new content.
-func printUnifiedDiff(oldContent, newContent, oldName, newName, oldLabel, newLabel string) {
+// formatUnifiedDiff returns a unified diff between old and new content as a string.
+func formatUnifiedDiff(oldContent, newContent, oldName, newName, oldLabel, newLabel string) string {
 	// Binary file detection
 	if oldLabel == "(binary)" || newLabel == "(binary)" {
 		name := strings.TrimPrefix(oldName, "a/")
 		if name == "/dev/null" {
 			name = strings.TrimPrefix(newName, "b/")
 		}
-		fmt.Printf("Binary file %s differs\n", name)
-		return
+		return fmt.Sprintf("Binary file %s differs\n", name)
 	}
 
 	// Symlink annotation
@@ -1119,52 +1217,56 @@ func printUnifiedDiff(oldContent, newContent, oldName, newName, oldLabel, newLab
 	}
 	text, err := difflib.GetUnifiedDiffString(diff)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: diff failed for %s: %v\n", oldName, err)
-		return
+		return fmt.Sprintf("warning: diff failed for %s: %v\n", oldName, err)
 	}
-	if text != "" {
-		fmt.Print(text)
-	}
+	return text
 }
 
-func printPlan(plan *snapshot.RestorePlan, snap *store.Snapshot) {
-	fmt.Printf("Restore to %s (%s):\n\n", shortHash(snap.Hash), snap.CreatedAt.Format("2006-01-02 15:04:05"))
+func formatPlan(plan *snapshot.RestorePlan, snap *store.Snapshot) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Restore to %s (%s):\n\n", shortHash(snap.Hash), snap.CreatedAt.Format("2006-01-02 15:04:05"))
 
 	if len(plan.Delete) > 0 {
-		fmt.Printf("  Delete %d file(s):\n", len(plan.Delete))
+		fmt.Fprintf(&b, "  Delete %d file(s):\n", len(plan.Delete))
 		for _, p := range plan.Delete {
-			fmt.Printf("    D %s\n", p)
+			fmt.Fprintf(&b, "    D %s\n", p)
 		}
-		fmt.Println()
+		b.WriteByte('\n')
 	}
 
 	if len(plan.Write) > 0 {
-		fmt.Printf("  Write %d file(s):\n", len(plan.Write))
+		fmt.Fprintf(&b, "  Write %d file(s):\n", len(plan.Write))
 		for _, p := range plan.Write {
-			fmt.Printf("    A %s\n", p)
+			fmt.Fprintf(&b, "    A %s\n", p)
 		}
-		fmt.Println()
+		b.WriteByte('\n')
 	}
 
 	if len(plan.Modify) > 0 {
-		fmt.Printf("  Modify %d file(s):\n", len(plan.Modify))
+		fmt.Fprintf(&b, "  Modify %d file(s):\n", len(plan.Modify))
 		for _, p := range plan.Modify {
-			fmt.Printf("    M %s\n", p)
+			fmt.Fprintf(&b, "    M %s\n", p)
 		}
-		fmt.Println()
+		b.WriteByte('\n')
 	}
 
 	if len(plan.Chmod) > 0 {
-		fmt.Printf("  Chmod %d file(s):\n", len(plan.Chmod))
+		fmt.Fprintf(&b, "  Chmod %d file(s):\n", len(plan.Chmod))
 		for _, c := range plan.Chmod {
-			fmt.Printf("    C %s (%04o → %04o)\n", c.Path, c.OldMode, c.NewMode)
+			fmt.Fprintf(&b, "    C %s (%04o → %04o)\n", c.Path, c.OldMode, c.NewMode)
 		}
-		fmt.Println()
+		b.WriteByte('\n')
 	}
 
 	if plan.Unchanged > 0 {
-		fmt.Printf("  Unchanged: %d file(s)\n\n", plan.Unchanged)
+		fmt.Fprintf(&b, "  Unchanged: %d file(s)\n\n", plan.Unchanged)
 	}
+
+	return b.String()
+}
+
+func printPlan(plan *snapshot.RestorePlan, snap *store.Snapshot) {
+	fmt.Print(formatPlan(plan, snap))
 }
 
 func confirm(prompt string) bool {

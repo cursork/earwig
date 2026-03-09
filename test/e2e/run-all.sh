@@ -17,6 +17,19 @@ fi
 
 echo ""
 echo "========================================="
+echo " TUI E2E tests"
+echo "========================================="
+if /test/tui_test.sh; then
+    echo ""
+    echo "TUI tests passed."
+else
+    echo ""
+    echo "TUI tests FAILED."
+    failed=1
+fi
+
+echo ""
+echo "========================================="
 echo " Generative E2E tests"
 echo "========================================="
 for i in 1 2 3; do
