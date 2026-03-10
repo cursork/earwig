@@ -256,6 +256,22 @@ expect_screen_contains "(root)" "root snapshot label"
 expect_screen_contains "A foo.txt" "root shows added file"
 
 # =========================================================
+# TEST TUI-9: Checkpoint names in TUI
+# =========================================================
+blue "=== TUI TEST 9: Checkpoint names in TUI ==="
+
+tui_stop
+
+init_project /tmp/earwig-tui-9
+write_file foo.txt "hello"
+snapshot
+earwig check my-mark > /dev/null
+
+tui_start /tmp/earwig-tui-9
+
+expect_screen_contains "(my-mark)" "checkpoint name in TUI"
+
+# =========================================================
 # Cleanup
 # =========================================================
 tui_stop

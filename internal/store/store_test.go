@@ -1200,3 +1200,281 @@ func TestGetBlobRejectsRawSizeLargerThanData(t *testing.T) {
 		t.Fatal("expected error for raw blob with oversized stored size")
 	}
 }
+
+// createTestSnapshot is a helper that creates a snapshot with one file.
+func createTestSnapshot(t *testing.T, s *Store, parentID *int64, msg string) *Snapshot {
+	t.Helper()
+	h, err := s.PutBlob([]byte(msg)) // unique content per message
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := s.CreateSnapshot(parentID, []SnapshotFile{
+		{Path: msg + ".txt", BlobHash: h, Mode: 0644, ModTime: time.Now(), Size: int64(len(msg))},
+	}, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snap
+}
+
+func TestSetCheckpoint(t *testing.T) {
+	s := testStore(t)
+	snap := createTestSnapshot(t, s, nil, "one")
+
+	if err := s.SetCheckpoint("my-check", snap.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetCheckpoint("my-check")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != snap.ID {
+		t.Fatalf("got snapshot ID %d, want %d", got.ID, snap.ID)
+	}
+}
+
+func TestSetCheckpointDuplicateFails(t *testing.T) {
+	s := testStore(t)
+	snap := createTestSnapshot(t, s, nil, "one")
+
+	if err := s.SetCheckpoint("dup", snap.ID); err != nil {
+		t.Fatal(err)
+	}
+	err := s.SetCheckpoint("dup", snap.ID)
+	if err == nil {
+		t.Fatal("expected error for duplicate checkpoint name")
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("expected 'already exists' error, got: %v", err)
+	}
+}
+
+func TestUpdateCheckpoint(t *testing.T) {
+	s := testStore(t)
+	snap1 := createTestSnapshot(t, s, nil, "one")
+	snap2 := createTestSnapshot(t, s, &snap1.ID, "two")
+
+	if err := s.SetCheckpoint("moveme", snap1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateCheckpoint("moveme", snap2.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetCheckpoint("moveme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != snap2.ID {
+		t.Fatalf("got snapshot ID %d, want %d", got.ID, snap2.ID)
+	}
+}
+
+func TestUpdateCheckpointNotFound(t *testing.T) {
+	s := testStore(t)
+	err := s.UpdateCheckpoint("nope", 999)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected 'not found' error, got: %v", err)
+	}
+}
+
+func TestDeleteCheckpoint(t *testing.T) {
+	s := testStore(t)
+	snap := createTestSnapshot(t, s, nil, "one")
+
+	if err := s.SetCheckpoint("delme", snap.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteCheckpoint("delme"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.GetCheckpoint("delme")
+	if err == nil {
+		t.Fatal("expected error after deletion")
+	}
+}
+
+func TestDeleteCheckpointNotFound(t *testing.T) {
+	s := testStore(t)
+	err := s.DeleteCheckpoint("nope")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestListCheckpoints(t *testing.T) {
+	s := testStore(t)
+	snap1 := createTestSnapshot(t, s, nil, "one")
+	snap2 := createTestSnapshot(t, s, &snap1.ID, "two")
+
+	s.SetCheckpoint("beta", snap1.ID)
+	s.SetCheckpoint("alpha", snap2.ID)
+
+	cps, err := s.ListCheckpoints()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cps) != 2 {
+		t.Fatalf("expected 2 checkpoints, got %d", len(cps))
+	}
+	// Should be alphabetically ordered
+	if cps[0].Name != "alpha" || cps[1].Name != "beta" {
+		t.Fatalf("expected [alpha, beta], got [%s, %s]", cps[0].Name, cps[1].Name)
+	}
+}
+
+func TestListCheckpointsEmpty(t *testing.T) {
+	s := testStore(t)
+	cps, err := s.ListCheckpoints()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cps) != 0 {
+		t.Fatalf("expected 0 checkpoints, got %d", len(cps))
+	}
+}
+
+func TestGetCheckpointsForSnapshot(t *testing.T) {
+	s := testStore(t)
+	snap := createTestSnapshot(t, s, nil, "one")
+
+	s.SetCheckpoint("first", snap.ID)
+	s.SetCheckpoint("second", snap.ID)
+
+	names, err := s.GetCheckpointsForSnapshot(snap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 2 {
+		t.Fatalf("expected 2, got %d", len(names))
+	}
+}
+
+func TestCheckpointsBySnapshot(t *testing.T) {
+	s := testStore(t)
+	snap1 := createTestSnapshot(t, s, nil, "one")
+	snap2 := createTestSnapshot(t, s, &snap1.ID, "two")
+
+	s.SetCheckpoint("a", snap1.ID)
+	s.SetCheckpoint("b", snap2.ID)
+	s.SetCheckpoint("c", snap1.ID)
+
+	m, err := s.CheckpointsBySnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m[snap1.ID]) != 2 {
+		t.Fatalf("expected 2 for snap1, got %d", len(m[snap1.ID]))
+	}
+	if len(m[snap2.ID]) != 1 {
+		t.Fatalf("expected 1 for snap2, got %d", len(m[snap2.ID]))
+	}
+}
+
+func TestResolveRefByCheckpoint(t *testing.T) {
+	s := testStore(t)
+	snap := createTestSnapshot(t, s, nil, "one")
+
+	s.SetCheckpoint("my-tag", snap.ID)
+
+	got, err := s.ResolveRef("my-tag")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != snap.ID {
+		t.Fatalf("got ID %d, want %d", got.ID, snap.ID)
+	}
+}
+
+func TestResolveRefByHash(t *testing.T) {
+	s := testStore(t)
+	snap := createTestSnapshot(t, s, nil, "one")
+
+	got, err := s.ResolveRef(snap.Hash[:8])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != snap.ID {
+		t.Fatalf("got ID %d, want %d", got.ID, snap.ID)
+	}
+}
+
+func TestResolveRefNotFound(t *testing.T) {
+	s := testStore(t)
+	_, err := s.ResolveRef("nonexistent")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "no checkpoint or snapshot matching") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDeleteSnapshotCascadesCheckpoints(t *testing.T) {
+	s := testStore(t)
+	snap := createTestSnapshot(t, s, nil, "one")
+	s.SetCheckpoint("doomed", snap.ID)
+
+	if err := s.DeleteSnapshot(snap.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.GetCheckpoint("doomed")
+	if err == nil {
+		t.Fatal("expected checkpoint to be deleted with snapshot")
+	}
+}
+
+func TestGetSnapshotByID(t *testing.T) {
+	s := testStore(t)
+	snap := createTestSnapshot(t, s, nil, "one")
+
+	got, err := s.GetSnapshotByID(snap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Hash != snap.Hash {
+		t.Fatalf("got hash %s, want %s", got.Hash, snap.Hash)
+	}
+}
+
+func TestMigrationV3toV4(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	// Create a v3 database manually
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Force version back to 3 and drop checkpoints table
+	s.db.Exec(`UPDATE meta SET value = '3' WHERE key = 'schema_version'`)
+	s.db.Exec(`DROP TABLE IF EXISTS checkpoints`)
+	s.db.Exec(`DROP INDEX IF EXISTS idx_checkpoints_snapshot`)
+	s.Close()
+
+	// Reopen — should migrate to v4
+	s2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopening: %v", err)
+	}
+	defer s2.Close()
+
+	var version string
+	if err := s2.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema_version'`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != "4" {
+		t.Fatalf("expected version 4, got %s", version)
+	}
+
+	// Verify checkpoints table exists by inserting
+	snap := createTestSnapshot(t, s2, nil, "test")
+	if err := s2.SetCheckpoint("v3-migrated", snap.ID); err != nil {
+		t.Fatalf("checkpoint after migration: %v", err)
+	}
+}

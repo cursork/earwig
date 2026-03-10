@@ -72,9 +72,10 @@ type tuiModel struct {
 	headID *int64
 
 	// Snapshot list
-	snapshots  []store.Snapshot // newest-first
-	cursor     int
-	listOffset int
+	snapshots   []store.Snapshot // newest-first
+	checkpoints map[int64][]string // snapshot ID -> checkpoint names
+	cursor      int
+	listOffset  int
 
 	// Diff state
 	diffContent string
@@ -130,6 +131,12 @@ func cmdTUI(args []string) error {
 		return nil
 	}
 
+	// Load checkpoint names
+	cpMap, err := s.CheckpointsBySnapshot()
+	if err != nil {
+		return err
+	}
+
 	// Reverse to newest-first
 	for i, j := 0, len(snapshots)-1; i < j; i, j = i+1, j-1 {
 		snapshots[i], snapshots[j] = snapshots[j], snapshots[i]
@@ -156,6 +163,7 @@ func cmdTUI(args []string) error {
 		ig:           ig,
 		headID:       headID,
 		snapshots:    snapshots,
+		checkpoints:  cpMap,
 		cursor:       cursor,
 		diffViewport: vp,
 		searchInput:  ti,
@@ -478,6 +486,12 @@ func (m tuiModel) renderSnapshotList() string {
 			line.WriteString("  ")
 		}
 		fmt.Fprintf(&line, "%s  %s  %-12s%s", hash, date, msg, summary)
+
+		if names, ok := m.checkpoints[snap.ID]; ok {
+			line.WriteString("  (")
+			line.WriteString(strings.Join(names, ", "))
+			line.WriteString(")")
+		}
 
 		if m.headID != nil && snap.ID == *m.headID {
 			line.WriteString("  ")

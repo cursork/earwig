@@ -287,6 +287,27 @@ func (s *Store) GetSnapshot(hashPrefix string) (*Snapshot, error) {
 	return &results[0], nil
 }
 
+func (s *Store) GetSnapshotByID(id int64) (*Snapshot, error) {
+	var snap Snapshot
+	var parentID sql.NullInt64
+	var createdAt string
+	err := s.db.QueryRow(
+		`SELECT id, hash, parent_id, created_at, message FROM snapshots WHERE id = ?`, id,
+	).Scan(&snap.ID, &snap.Hash, &parentID, &createdAt, &snap.Message)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot %d not found: %w", id, err)
+	}
+	if parentID.Valid {
+		snap.ParentID = &parentID.Int64
+	}
+	var parseErr error
+	snap.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
+	if parseErr != nil {
+		return nil, fmt.Errorf("corrupt timestamp %q in snapshot %d: %w", createdAt, id, parseErr)
+	}
+	return &snap, nil
+}
+
 func (s *Store) GetSnapshotFiles(snapshotID int64) ([]SnapshotFile, error) {
 	rows, err := s.db.Query(
 		`SELECT path, blob_hash, mode, mod_time, size, type FROM snapshot_files WHERE snapshot_id = ? ORDER BY path`,
@@ -401,6 +422,9 @@ func (s *Store) DeleteSnapshot(id int64) error {
 		return fmt.Errorf("re-parenting children: %w", err)
 	}
 
+	if _, err := tx.Exec(`DELETE FROM checkpoints WHERE snapshot_id = ?`, id); err != nil {
+		return fmt.Errorf("deleting checkpoints: %w", err)
+	}
 	if _, err := tx.Exec(`DELETE FROM snapshot_files WHERE snapshot_id = ?`, id); err != nil {
 		return fmt.Errorf("deleting snapshot files: %w", err)
 	}
@@ -419,6 +443,161 @@ func (s *Store) GarbageCollect() (int64, error) {
 		return 0, fmt.Errorf("garbage collecting blobs: %w", err)
 	}
 	return result.RowsAffected()
+}
+
+// ResolveRef looks up a ref string: first as a checkpoint name, then as a hash prefix.
+func (s *Store) ResolveRef(ref string) (*Snapshot, error) {
+	snap, err := s.GetCheckpoint(ref)
+	if err == nil {
+		return snap, nil
+	}
+	// Fall through to hash prefix lookup
+	snap, err = s.GetSnapshot(ref)
+	if err != nil {
+		return nil, fmt.Errorf("no checkpoint or snapshot matching: %s", ref)
+	}
+	return snap, nil
+}
+
+// SetCheckpoint creates a new checkpoint. Returns error if name already exists.
+func (s *Store) SetCheckpoint(name string, snapshotID int64) error {
+	_, err := s.db.Exec(`INSERT INTO checkpoints (name, snapshot_id) VALUES (?, ?)`, name, snapshotID)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint") || strings.Contains(err.Error(), "PRIMARY KEY") {
+			return fmt.Errorf("checkpoint %q already exists (use -u to move it)", name)
+		}
+		return fmt.Errorf("creating checkpoint: %w", err)
+	}
+	return nil
+}
+
+// UpdateCheckpoint moves an existing checkpoint to a new snapshot.
+func (s *Store) UpdateCheckpoint(name string, snapshotID int64) error {
+	result, err := s.db.Exec(`UPDATE checkpoints SET snapshot_id = ? WHERE name = ?`, snapshotID, name)
+	if err != nil {
+		return fmt.Errorf("updating checkpoint: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("checkpoint not found: %s", name)
+	}
+	return nil
+}
+
+// DeleteCheckpoint removes a checkpoint by name.
+func (s *Store) DeleteCheckpoint(name string) error {
+	result, err := s.db.Exec(`DELETE FROM checkpoints WHERE name = ?`, name)
+	if err != nil {
+		return fmt.Errorf("deleting checkpoint: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("checkpoint not found: %s", name)
+	}
+	return nil
+}
+
+// GetCheckpoint looks up a checkpoint by name and returns the referenced snapshot.
+func (s *Store) GetCheckpoint(name string) (*Snapshot, error) {
+	var snap Snapshot
+	var parentID sql.NullInt64
+	var createdAt string
+	err := s.db.QueryRow(
+		`SELECT s.id, s.hash, s.parent_id, s.created_at, s.message
+		 FROM checkpoints c JOIN snapshots s ON c.snapshot_id = s.id
+		 WHERE c.name = ?`, name,
+	).Scan(&snap.ID, &snap.Hash, &parentID, &createdAt, &snap.Message)
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint not found: %s", name)
+	}
+	if parentID.Valid {
+		snap.ParentID = &parentID.Int64
+	}
+	var parseErr error
+	snap.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
+	if parseErr != nil {
+		return nil, fmt.Errorf("corrupt timestamp in checkpoint %s: %w", name, parseErr)
+	}
+	return &snap, nil
+}
+
+// ListCheckpoints returns all checkpoints ordered by name.
+func (s *Store) ListCheckpoints() ([]Checkpoint, error) {
+	rows, err := s.db.Query(
+		`SELECT c.name, c.snapshot_id, s.hash, s.parent_id, s.created_at, s.message
+		 FROM checkpoints c JOIN snapshots s ON c.snapshot_id = s.id
+		 ORDER BY c.name`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var checkpoints []Checkpoint
+	for rows.Next() {
+		var cp Checkpoint
+		var parentID sql.NullInt64
+		var createdAt string
+		if err := rows.Scan(&cp.Name, &cp.SnapshotID, &cp.Snapshot.Hash, &parentID, &createdAt, &cp.Snapshot.Message); err != nil {
+			return nil, err
+		}
+		cp.Snapshot.ID = cp.SnapshotID
+		if parentID.Valid {
+			cp.Snapshot.ParentID = &parentID.Int64
+		}
+		var parseErr error
+		cp.Snapshot.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
+		if parseErr != nil {
+			return nil, fmt.Errorf("corrupt timestamp in checkpoint %s: %w", cp.Name, parseErr)
+		}
+		checkpoints = append(checkpoints, cp)
+	}
+	return checkpoints, rows.Err()
+}
+
+// GetCheckpointsForSnapshot returns checkpoint names for a given snapshot ID.
+func (s *Store) GetCheckpointsForSnapshot(snapshotID int64) ([]string, error) {
+	rows, err := s.db.Query(`SELECT name FROM checkpoints WHERE snapshot_id = ? ORDER BY name`, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
+// CheckpointsBySnapshot returns a map of snapshot ID to checkpoint names.
+func (s *Store) CheckpointsBySnapshot() (map[int64][]string, error) {
+	rows, err := s.db.Query(`SELECT snapshot_id, name FROM checkpoints ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	m := make(map[int64][]string)
+	for rows.Next() {
+		var snapID int64
+		var name string
+		if err := rows.Scan(&snapID, &name); err != nil {
+			return nil, err
+		}
+		m[snapID] = append(m[snapID], name)
+	}
+	return m, rows.Err()
 }
 
 func (s *Store) DiffSnapshots(oldID, newID int64) ([]FileChange, error) {

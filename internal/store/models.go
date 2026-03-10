@@ -34,3 +34,9 @@ type FileChange struct {
 	OldHash string
 	NewHash string
 }
+
+type Checkpoint struct {
+	Name       string
+	SnapshotID int64
+	Snapshot   Snapshot
+}

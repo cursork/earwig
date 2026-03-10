@@ -32,8 +32,14 @@ CREATE TABLE IF NOT EXISTS snapshot_files (
     PRIMARY KEY (snapshot_id, path)
 );
 
+CREATE TABLE IF NOT EXISTS checkpoints (
+    name        TEXT PRIMARY KEY,
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_snapshots_parent ON snapshots(parent_id);
 CREATE INDEX IF NOT EXISTS idx_snapshot_files_blob ON snapshot_files(blob_hash);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_snapshot ON checkpoints(snapshot_id);
 `
 
 func (s *Store) migrate() error {
@@ -47,7 +53,7 @@ func (s *Store) migrate() error {
 	err = s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema_version'`).Scan(&version)
 	if err != nil {
 		// First run — set version
-		_, err = s.db.Exec(`INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '3')`)
+		_, err = s.db.Exec(`INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '4')`)
 		return err
 	}
 
@@ -79,7 +85,27 @@ func (s *Store) migrate() error {
 				return err
 			}
 		}
+		version = "3"
 		if _, err = s.db.Exec(`UPDATE meta SET value = '3' WHERE key = 'schema_version'`); err != nil {
+			return err
+		}
+	}
+
+	if version == "3" {
+		// v3 -> v4: add checkpoints table
+		var count int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='checkpoints'`).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			if _, err = s.db.Exec(`CREATE TABLE checkpoints (name TEXT PRIMARY KEY, snapshot_id INTEGER NOT NULL REFERENCES snapshots(id))`); err != nil {
+				return err
+			}
+			if _, err = s.db.Exec(`CREATE INDEX idx_checkpoints_snapshot ON checkpoints(snapshot_id)`); err != nil {
+				return err
+			}
+		}
+		if _, err = s.db.Exec(`UPDATE meta SET value = '4' WHERE key = 'schema_version'`); err != nil {
 			return err
 		}
 	}

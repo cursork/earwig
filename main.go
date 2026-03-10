@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -35,6 +36,8 @@ var commands = map[string]func([]string) error{
 	"diff":     cmdDiff,
 	"gc":       cmdGC,
 	"forget":   cmdForget,
+	"check":     cmdCheck,
+	"checks":    cmdChecks,
 	"tui":       cmdTUI,
 	"processes": cmdProcesses,
 	"db":        cmdDB,
@@ -78,6 +81,10 @@ Commands:
   show <hash> [file...]   Show changes in a snapshot, or print file contents
   diff <hash>             Show what a restore would change vs current state
   restore [-y] <hash>     Restore filesystem to a snapshot
+  check [name] [hash]     Create a checkpoint (random name if omitted)
+  check -d <name>         Delete a checkpoint
+  check -u <name> [hash]  Move a checkpoint to a different snapshot
+  checks                  List all checkpoints
   forget <hash>           Delete a snapshot (re-parents children, runs GC)
   gc                      Remove orphaned blobs
   tui                     Interactive snapshot browser
@@ -233,10 +240,16 @@ func cmdLog(args []string) error {
 		return err
 	}
 
+	// Load checkpoint names for display
+	cpMap, err := s.CheckpointsBySnapshot()
+	if err != nil {
+		return err
+	}
+
 	// File filter mode: earwig log <file>
 	if len(args) > 0 {
 		filterPath := filepath.ToSlash(args[0])
-		return cmdLogFiltered(s, snapshots, headID, filterPath)
+		return cmdLogFiltered(s, snapshots, headID, cpMap, filterPath)
 	}
 
 	// Graph state: each column tracks which snapshot ID it's tracing toward.
@@ -312,18 +325,25 @@ func cmdLog(args []string) error {
 		// Build A/M/D change summary
 		changeSummary := changeSummaryFor(s, &snap)
 
+		// Checkpoint names
+		cpLabel := ""
+		if names, ok := cpMap[snap.ID]; ok {
+			cpLabel = "  (" + strings.Join(names, ", ") + ")"
+		}
+
 		// HEAD marker
 		headMark := ""
 		if headID != nil && snap.ID == *headID {
 			headMark = "  <- HERE"
 		}
 
-		fmt.Printf("%s%s  %s  %s%s%s\n",
+		fmt.Printf("%s%s  %s  %s%s%s%s\n",
 			prefix,
 			shortHash(snap.Hash),
 			snap.CreatedAt.Format("2006-01-02 15:04:05"),
 			snap.Message,
 			changeSummary,
+			cpLabel,
 			headMark,
 		)
 
@@ -343,7 +363,7 @@ func cmdLog(args []string) error {
 }
 
 // cmdLogFiltered shows a flat list of snapshots that changed the given file.
-func cmdLogFiltered(s *store.Store, snapshots []store.Snapshot, headID *int64, filterPath string) error {
+func cmdLogFiltered(s *store.Store, snapshots []store.Snapshot, headID *int64, cpMap map[int64][]string, filterPath string) error {
 	found := false
 	// Process newest-first
 	for i := len(snapshots) - 1; i >= 0; i-- {
@@ -354,6 +374,11 @@ func cmdLogFiltered(s *store.Store, snapshots []store.Snapshot, headID *int64, f
 		}
 		found = true
 
+		cpLabel := ""
+		if names, ok := cpMap[snap.ID]; ok {
+			cpLabel = "  (" + strings.Join(names, ", ") + ")"
+		}
+
 		headMark := ""
 		if headID != nil && snap.ID == *headID {
 			headMark = "  <- HERE"
@@ -361,11 +386,12 @@ func cmdLogFiltered(s *store.Store, snapshots []store.Snapshot, headID *int64, f
 
 		changeSummary := changeSummaryFor(s, &snap)
 
-		fmt.Printf("* %s  %s  %s%s%s\n",
+		fmt.Printf("* %s  %s  %s%s%s%s\n",
 			shortHash(snap.Hash),
 			snap.CreatedAt.Format("2006-01-02 15:04:05"),
 			snap.Message,
 			changeSummary,
+			cpLabel,
 			headMark,
 		)
 	}
@@ -512,7 +538,7 @@ func cmdShow(args []string) error {
 	}
 	defer s.Close()
 
-	snap, err := s.GetSnapshot(args[0])
+	snap, err := s.ResolveRef(args[0])
 	if err != nil {
 		return err
 	}
@@ -604,7 +630,7 @@ func cmdFiles(args []string) error {
 	}
 	defer s.Close()
 
-	snap, err := s.GetSnapshot(args[0])
+	snap, err := s.ResolveRef(args[0])
 	if err != nil {
 		return err
 	}
@@ -885,7 +911,7 @@ func cmdRestore(args []string) error {
 	}
 	defer s.Close()
 
-	snap, err := s.GetSnapshot(fs.Arg(0))
+	snap, err := s.ResolveRef(fs.Arg(0))
 	if err != nil {
 		return err
 	}
@@ -975,7 +1001,7 @@ func cmdDiff(args []string) error {
 	}
 	defer s.Close()
 
-	snap, err := s.GetSnapshot(args[0])
+	snap, err := s.ResolveRef(args[0])
 	if err != nil {
 		return err
 	}
@@ -990,6 +1016,186 @@ func cmdDiff(args []string) error {
 		return err
 	}
 	fmt.Print(result)
+	return nil
+}
+
+// Checkpoint name validation: alphanumeric, hyphens, underscores, dots.
+// Must not be pure hex (ambiguous with hashes).
+var validCheckpointName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+var pureHex = regexp.MustCompile(`^[0-9a-f]+$`)
+
+func validateCheckpointName(name string) error {
+	if !validCheckpointName.MatchString(name) {
+		return fmt.Errorf("invalid checkpoint name %q (use alphanumeric, hyphens, underscores, dots; max 64 chars)", name)
+	}
+	if pureHex.MatchString(name) {
+		return fmt.Errorf("checkpoint name %q looks like a hash prefix (must contain non-hex characters)", name)
+	}
+	return nil
+}
+
+func cmdCheck(args []string) error {
+	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	del := fs.Bool("d", false, "delete a checkpoint")
+	update := fs.Bool("u", false, "move an existing checkpoint")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	s, root, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	// Delete mode: earwig check -d <name>
+	if *del {
+		if fs.NArg() < 1 {
+			return fmt.Errorf("usage: earwig check -d <name>")
+		}
+		name := fs.Arg(0)
+		if err := s.DeleteCheckpoint(name); err != nil {
+			return err
+		}
+		fmt.Printf("Deleted checkpoint %s\n", name)
+		return nil
+	}
+
+	// Update mode: earwig check -u <name> [hash]
+	if *update {
+		if fs.NArg() < 1 {
+			return fmt.Errorf("usage: earwig check -u <name> [hash]")
+		}
+		name := fs.Arg(0)
+		var snap *store.Snapshot
+		if fs.NArg() >= 2 {
+			snap, err = s.ResolveRef(fs.Arg(1))
+			if err != nil {
+				return err
+			}
+		} else {
+			headID, err := readHead(root, s)
+			if err != nil {
+				return err
+			}
+			if headID == nil {
+				return fmt.Errorf("no HEAD snapshot")
+			}
+			snap, err = s.GetSnapshotByID(*headID)
+			if err != nil {
+				return err
+			}
+		}
+		if err := s.UpdateCheckpoint(name, snap.ID); err != nil {
+			return err
+		}
+		fmt.Printf("Moved checkpoint %s -> %s\n", name, shortHash(snap.Hash))
+		return nil
+	}
+
+	// Create mode
+	switch fs.NArg() {
+	case 0:
+		// earwig check — random name on HEAD
+		headID, err := readHead(root, s)
+		if err != nil {
+			return err
+		}
+		if headID == nil {
+			return fmt.Errorf("no HEAD snapshot")
+		}
+		snap, err := s.GetSnapshotByID(*headID)
+		if err != nil {
+			return err
+		}
+		// Generate a unique random name
+		var name string
+		for i := 0; i < 20; i++ {
+			name, err = randomCheckpointName()
+			if err != nil {
+				return err
+			}
+			err = s.SetCheckpoint(name, snap.ID)
+			if err == nil {
+				fmt.Printf("Checkpoint %s -> %s\n", name, shortHash(snap.Hash))
+				return nil
+			}
+			// If it's a uniqueness error, retry; otherwise surface
+			if !strings.Contains(err.Error(), "already exists") {
+				return err
+			}
+		}
+		return fmt.Errorf("could not generate a unique checkpoint name after 20 attempts")
+
+	case 1:
+		// earwig check <name> — named checkpoint on HEAD
+		name := fs.Arg(0)
+		if err := validateCheckpointName(name); err != nil {
+			return err
+		}
+		headID, err := readHead(root, s)
+		if err != nil {
+			return err
+		}
+		if headID == nil {
+			return fmt.Errorf("no HEAD snapshot")
+		}
+		snap, err := s.GetSnapshotByID(*headID)
+		if err != nil {
+			return err
+		}
+		if err := s.SetCheckpoint(name, snap.ID); err != nil {
+			return err
+		}
+		fmt.Printf("Checkpoint %s -> %s\n", name, shortHash(snap.Hash))
+		return nil
+
+	case 2:
+		// earwig check <name> <hash> — named checkpoint on specific snapshot
+		name := fs.Arg(0)
+		if err := validateCheckpointName(name); err != nil {
+			return err
+		}
+		snap, err := s.ResolveRef(fs.Arg(1))
+		if err != nil {
+			return err
+		}
+		if err := s.SetCheckpoint(name, snap.ID); err != nil {
+			return err
+		}
+		fmt.Printf("Checkpoint %s -> %s\n", name, shortHash(snap.Hash))
+		return nil
+
+	default:
+		return fmt.Errorf("usage: earwig check [name] [hash]")
+	}
+}
+
+func cmdChecks(args []string) error {
+	s, _, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	checkpoints, err := s.ListCheckpoints()
+	if err != nil {
+		return err
+	}
+
+	if len(checkpoints) == 0 {
+		fmt.Println("No checkpoints.")
+		return nil
+	}
+
+	for _, cp := range checkpoints {
+		fmt.Printf("%-20s  %s  %s  %s\n",
+			cp.Name,
+			shortHash(cp.Snapshot.Hash),
+			cp.Snapshot.CreatedAt.Format("2006-01-02 15:04:05"),
+			cp.Snapshot.Message,
+		)
+	}
 	return nil
 }
 
@@ -1293,7 +1499,7 @@ func cmdForget(args []string) error {
 	}
 	defer flockFile.Close()
 
-	snap, err := s.GetSnapshot(args[0])
+	snap, err := s.ResolveRef(args[0])
 	if err != nil {
 		return err
 	}
@@ -1307,10 +1513,16 @@ func cmdForget(args []string) error {
 		return fmt.Errorf("cannot forget the current HEAD snapshot")
 	}
 
+	// Check for checkpoints that will be cascade-deleted.
+	cpNames, _ := s.GetCheckpointsForSnapshot(snap.ID)
+
 	if err := s.DeleteSnapshot(snap.ID); err != nil {
 		return err
 	}
 	fmt.Printf("Forgot snapshot %s\n", shortHash(snap.Hash))
+	for _, name := range cpNames {
+		fmt.Printf("Deleted checkpoint %s\n", name)
+	}
 
 	// Run GC to clean up any blobs orphaned by this deletion.
 	count, err := s.GarbageCollect()

@@ -600,7 +600,7 @@ expect_file_mode "exec.sh" "755"
 expect_file_mode "readonly.txt" "444"
 
 # =========================================================
-# TEST 18: Schema migration v1 -> v3
+# TEST 18: Schema migration v1 -> v4
 # =========================================================
 blue "=== TEST 18: Schema migration ==="
 
@@ -627,16 +627,16 @@ else
     fail "downgraded to v1" "version is $v"
 fi
 
-# Now open with earwig — migration should run (v1 -> v2 -> v3)
+# Now open with earwig — migration should run (v1 -> v2 -> v3 -> v4)
 write_file "migrated.txt" "after migration"
 snapshot                                        # snapshot #1
 
-# Verify schema is now v3
+# Verify schema is now v4
 v=$(sqlite3 "$db" "SELECT value FROM meta WHERE key='schema_version'")
-if [ "$v" = "3" ]; then
-    pass "migrated to v3"
+if [ "$v" = "4" ]; then
+    pass "migrated to v4"
 else
-    fail "migrated to v3" "version is $v"
+    fail "migrated to v4" "version is $v"
 fi
 
 # Verify the type column exists and works
@@ -1839,6 +1839,207 @@ if echo "$db_tables" | grep -q "snapshots"; then
 else
     fail "db dot-commands work" "got: $db_tables"
 fi
+
+# =========================================================
+# TEST 50: Checkpoint create and list
+# =========================================================
+blue "=== TEST 50: Checkpoint create and list ==="
+init_project /tmp/earwig-test-50
+
+write_file a.txt "alpha"
+snapshot
+write_file b.txt "beta"
+snapshot
+
+# Named checkpoint on HEAD
+earwig check my-check > /dev/null
+output=$(earwig checks)
+if echo "$output" | grep -q "my-check"; then
+    pass "checkpoint listed"
+else
+    fail "checkpoint listed" "got: $output"
+fi
+
+# Resolve by checkpoint name
+output=$(earwig show my-check 2>&1)
+if echo "$output" | grep -q "Snapshot"; then
+    pass "show resolves checkpoint name"
+else
+    fail "show resolves checkpoint name" "got: $output"
+fi
+
+# Diff resolves by name
+output=$(earwig diff my-check 2>&1)
+if [ $? -eq 0 ]; then
+    pass "diff resolves checkpoint name"
+else
+    fail "diff resolves checkpoint name" "got: $output"
+fi
+
+# =========================================================
+# TEST 51: Checkpoint with random name
+# =========================================================
+blue "=== TEST 51: Checkpoint with random name ==="
+
+earwig check > /tmp/earwig-check-output 2>&1
+output=$(cat /tmp/earwig-check-output)
+if echo "$output" | grep -q "Checkpoint"; then
+    pass "random checkpoint created"
+else
+    fail "random checkpoint created" "got: $output"
+fi
+
+checks_output=$(earwig checks)
+check_count=$(echo "$checks_output" | wc -l | tr -d ' ')
+if [ "$check_count" -eq 2 ]; then
+    pass "2 checkpoints listed"
+else
+    fail "2 checkpoints listed" "got: $check_count"
+fi
+
+# =========================================================
+# TEST 52: Checkpoint on specific hash
+# =========================================================
+blue "=== TEST 52: Checkpoint on specific hash ==="
+
+first_hash="${SNAPSHOTS[0]}"
+earwig check on-first "$first_hash" > /dev/null
+output=$(earwig show on-first 2>&1)
+if echo "$output" | grep -q "$first_hash"; then
+    pass "checkpoint on specific hash resolves"
+else
+    fail "checkpoint on specific hash resolves" "got: $output"
+fi
+
+# =========================================================
+# TEST 53: Delete checkpoint
+# =========================================================
+blue "=== TEST 53: Delete checkpoint ==="
+
+earwig check -d on-first > /dev/null
+output=$(earwig checks)
+if echo "$output" | grep -q "on-first"; then
+    fail "checkpoint deleted" "still listed: $output"
+else
+    pass "checkpoint deleted"
+fi
+
+# =========================================================
+# TEST 54: Move checkpoint
+# =========================================================
+blue "=== TEST 54: Move checkpoint ==="
+
+earwig check -u my-check "$first_hash" > /dev/null
+output=$(earwig show my-check 2>&1)
+if echo "$output" | grep -q "$first_hash"; then
+    pass "checkpoint moved to first snapshot"
+else
+    fail "checkpoint moved to first snapshot" "got: $output"
+fi
+
+# Move to HEAD (no hash arg)
+earwig check -u my-check > /dev/null
+output=$(earwig show my-check 2>&1)
+if echo "$output" | grep -q "${SNAPSHOTS[1]}"; then
+    pass "checkpoint moved to HEAD"
+else
+    fail "checkpoint moved to HEAD" "got: $output"
+fi
+
+# =========================================================
+# TEST 55: Forget cascade-deletes checkpoints
+# =========================================================
+blue "=== TEST 55: Forget cascade-deletes checkpoints ==="
+init_project /tmp/earwig-test-55
+
+write_file a.txt "alpha"
+snapshot
+write_file b.txt "beta"
+snapshot
+
+earwig check doomed "${SNAPSHOTS[0]}" > /dev/null
+output=$(earwig forget "${SNAPSHOTS[0]}" 2>&1)
+if echo "$output" | grep -q "Deleted checkpoint doomed"; then
+    pass "forget reports deleted checkpoint"
+else
+    fail "forget reports deleted checkpoint" "got: $output"
+fi
+
+output=$(earwig checks)
+if echo "$output" | grep -q "doomed"; then
+    fail "checkpoint removed after forget" "still listed"
+else
+    pass "checkpoint removed after forget"
+fi
+
+# =========================================================
+# TEST 56: Checkpoints in log
+# =========================================================
+blue "=== TEST 56: Checkpoints in log ==="
+init_project /tmp/earwig-test-56
+
+write_file a.txt "alpha"
+snapshot
+earwig check tagged > /dev/null
+
+output=$(earwig log 2>&1)
+if echo "$output" | grep -q "(tagged)"; then
+    pass "checkpoint name in log"
+else
+    fail "checkpoint name in log" "got: $output"
+fi
+
+# Also test filtered log
+output=$(earwig log a.txt 2>&1)
+if echo "$output" | grep -q "(tagged)"; then
+    pass "checkpoint name in filtered log"
+else
+    fail "checkpoint name in filtered log" "got: $output"
+fi
+
+# =========================================================
+# TEST 57: Checkpoint name validation
+# =========================================================
+blue "=== TEST 57: Checkpoint name validation ==="
+
+output=$(earwig check "abc123" 2>&1) && ec=0 || ec=$?
+if [ "$ec" -ne 0 ] && echo "$output" | grep -q "hash prefix"; then
+    pass "pure hex name rejected"
+else
+    fail "pure hex name rejected" "got: $output"
+fi
+
+output=$(earwig check "has space" 2>&1) && ec=0 || ec=$?
+if [ "$ec" -ne 0 ] && echo "$output" | grep -q "invalid"; then
+    pass "whitespace name rejected"
+else
+    fail "whitespace name rejected" "got: $output"
+fi
+
+# Duplicate name
+earwig check dup-test > /dev/null
+output=$(earwig check dup-test 2>&1) && ec=0 || ec=$?
+if [ "$ec" -ne 0 ] && echo "$output" | grep -q "already exists"; then
+    pass "duplicate name rejected"
+else
+    fail "duplicate name rejected" "got: $output"
+fi
+
+# =========================================================
+# TEST 58: Restore by checkpoint name
+# =========================================================
+blue "=== TEST 58: Restore by checkpoint name ==="
+init_project /tmp/earwig-test-58
+
+write_file a.txt "version1"
+snapshot
+earwig check v1 > /dev/null
+
+write_file a.txt "version2"
+snapshot
+
+earwig restore -y v1 > /dev/null
+expect_file a.txt "version1"
 
 # =========================================================
 # DONE

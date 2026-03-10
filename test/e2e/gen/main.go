@@ -64,6 +64,9 @@ type Harness struct {
 	pass      int
 	fail      int
 
+	// Checkpoints: name -> snapshot index in h.snapshots
+	checkpoints map[string]int
+
 	// Operation counters
 	opCounts    map[string]int
 	bytesWritten int64
@@ -83,11 +86,12 @@ func newHarness(seed int64) *Harness {
 	}
 
 	h := &Harness{
-		dir:      dir,
-		seed:     seed,
-		model:    newModel(),
-		rng:      rand.New(rand.NewSource(seed)),
-		opCounts: make(map[string]int),
+		dir:         dir,
+		seed:        seed,
+		model:       newModel(),
+		rng:         rand.New(rand.NewSource(seed)),
+		opCounts:    make(map[string]int),
+		checkpoints: make(map[string]int),
 	}
 
 	// earwig init
@@ -448,6 +452,16 @@ func (h *Harness) opForget() {
 	h.earwig("forget", snap.hash)
 	fmt.Printf("  forget #%d (%s)\n", idx+1, snap.hash)
 
+	// Remove checkpoints pointing at this snapshot
+	for name, cpIdx := range h.checkpoints {
+		if cpIdx == idx {
+			delete(h.checkpoints, name)
+		} else if cpIdx > idx {
+			// Adjust indices for removed element
+			h.checkpoints[name] = cpIdx - 1
+		}
+	}
+
 	// Remove from our tracking slice
 	h.snapshots = append(h.snapshots[:idx], h.snapshots[idx+1:]...)
 
@@ -475,6 +489,93 @@ func (h *Harness) opGC() {
 		check := h.snapshots[h.rng.Intn(len(h.snapshots))]
 		h.verifyFiles(check.hash, check.model)
 	}
+}
+
+func (h *Harness) opCheckpoint() {
+	if len(h.snapshots) == 0 {
+		return
+	}
+
+	// Pick a random snapshot to checkpoint
+	idx := h.rng.Intn(len(h.snapshots))
+	name := fmt.Sprintf("check-%d-%d", h.opCounts["checkpoint"], h.rng.Intn(1000))
+	snap := h.snapshots[idx]
+
+	h.earwig("check", name, snap.hash)
+	fmt.Printf("  checkpoint %s -> #%d (%s)\n", name, idx+1, snap.hash)
+
+	h.checkpoints[name] = idx
+
+	// Verify it shows up in earwig checks
+	output := h.earwig("checks")
+	if !strings.Contains(output, name) {
+		h.fail++
+		fmt.Printf("    FAIL: checkpoint %s not in 'earwig checks' output\n", name)
+	} else {
+		h.pass++
+	}
+
+	// Verify it resolves via earwig show
+	output = h.earwig("show", name)
+	if !strings.Contains(output, snap.hash) {
+		h.fail++
+		fmt.Printf("    FAIL: checkpoint %s doesn't resolve to %s\n", name, snap.hash)
+	} else {
+		h.pass++
+	}
+}
+
+func (h *Harness) opCheckpointDelete() {
+	if len(h.checkpoints) == 0 {
+		return
+	}
+
+	// Pick a random checkpoint to delete
+	var names []string
+	for n := range h.checkpoints {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	name := names[h.rng.Intn(len(names))]
+
+	h.earwig("check", "-d", name)
+	fmt.Printf("  checkpoint delete %s\n", name)
+	delete(h.checkpoints, name)
+
+	// Verify it's gone
+	output := h.earwig("checks")
+	if strings.Contains(output, name) {
+		h.fail++
+		fmt.Printf("    FAIL: checkpoint %s still in 'earwig checks' after delete\n", name)
+	} else {
+		h.pass++
+	}
+}
+
+func (h *Harness) opCheckpointRestore() {
+	if len(h.checkpoints) == 0 {
+		return
+	}
+
+	// Pick a random checkpoint to restore by name
+	var names []string
+	for n := range h.checkpoints {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	name := names[h.rng.Intn(len(names))]
+	idx := h.checkpoints[name]
+	snap := h.snapshots[idx]
+
+	h.earwig("restore", "-y", name)
+	h.model = snap.model.clone()
+	h.headHash = snap.hash
+	fmt.Printf("  checkpoint restore %s -> #%d (%s)\n", name, idx+1, snap.hash)
+
+	h.verify(fmt.Sprintf("after checkpoint restore %s", name))
+
+	// Diff check: restored snapshot should match filesystem exactly
+	h.verifyDiff(snap.hash)
 }
 
 // ── helpers ────────────────────────────────────────────
@@ -749,6 +850,9 @@ func main() {
 		{12, "restore", h.opRestore},
 		{3, "forget", h.opForget},
 		{2, "gc", h.opGC},
+		{2, "checkpoint", h.opCheckpoint},
+		{1, "checkpoint_delete", h.opCheckpointDelete},
+		{2, "checkpoint_restore", h.opCheckpointRestore},
 	}
 	totalWeight := 0
 	for _, op := range ops {
@@ -782,7 +886,7 @@ func main() {
 
 	// Operation counts
 	fmt.Printf("\nOperations:\n")
-	for _, name := range []string{"write", "chmod", "symlink", "delete_file", "delete_dir", "snapshot", "restore", "forget", "gc"} {
+	for _, name := range []string{"write", "chmod", "symlink", "delete_file", "delete_dir", "snapshot", "restore", "forget", "gc", "checkpoint", "checkpoint_delete", "checkpoint_restore"} {
 		fmt.Printf("  %-12s %d\n", name, h.opCounts[name])
 	}
 	fmt.Printf("  %-12s %d\n", "snapshots_ok", len(h.snapshots))
