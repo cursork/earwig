@@ -600,6 +600,49 @@ func (s *Store) CheckpointsBySnapshot() (map[int64][]string, error) {
 	return m, rows.Err()
 }
 
+// BlobRefs returns all (blob_hash -> []BlobRef) mappings for files (not symlinks).
+// If snapshotIDs is non-empty, only those snapshots are included.
+// If maxSize > 0, blobs larger than maxSize bytes are excluded.
+// Results are grouped by blob_hash for dedup searching.
+func (s *Store) BlobRefs(snapshotIDs []int64, maxSize int64) (map[string][]BlobRef, error) {
+	var conditions []string
+	var args []interface{}
+
+	conditions = append(conditions, "type = 'file'")
+
+	if maxSize > 0 {
+		conditions = append(conditions, "size <= ?")
+		args = append(args, maxSize)
+	}
+
+	if len(snapshotIDs) > 0 {
+		placeholders := make([]string, len(snapshotIDs))
+		for i, id := range snapshotIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		conditions = append(conditions, "snapshot_id IN ("+strings.Join(placeholders, ",")+")")
+	}
+
+	query := "SELECT blob_hash, snapshot_id, path FROM snapshot_files WHERE " + strings.Join(conditions, " AND ") + " ORDER BY blob_hash"
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	m := make(map[string][]BlobRef)
+	for rows.Next() {
+		var hash string
+		var ref BlobRef
+		if err := rows.Scan(&hash, &ref.SnapshotID, &ref.Path); err != nil {
+			return nil, err
+		}
+		m[hash] = append(m[hash], ref)
+	}
+	return m, rows.Err()
+}
+
 func (s *Store) DiffSnapshots(oldID, newID int64) ([]FileChange, error) {
 	oldFiles, err := s.GetSnapshotFiles(oldID)
 	if err != nil {

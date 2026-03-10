@@ -1478,3 +1478,68 @@ func TestMigrationV3toV4(t *testing.T) {
 		t.Fatalf("checkpoint after migration: %v", err)
 	}
 }
+
+func TestBlobRefs(t *testing.T) {
+	s := testStore(t)
+	snap1 := createTestSnapshot(t, s, nil, "one")
+	snap2 := createTestSnapshot(t, s, &snap1.ID, "two")
+
+	refs, err := s.BlobRefs(nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) == 0 {
+		t.Fatal("expected some blob refs")
+	}
+
+	// Each snapshot has one file, so we expect 2 refs total
+	total := 0
+	for _, r := range refs {
+		total += len(r)
+	}
+	if total != 2 {
+		t.Fatalf("expected 2 total refs, got %d", total)
+	}
+
+	// Filter by snapshot ID
+	refs2, err := s.BlobRefs([]int64{snap2.ID}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total2 := 0
+	for _, r := range refs2 {
+		total2 += len(r)
+	}
+	if total2 != 1 {
+		t.Fatalf("expected 1 ref for snap2, got %d", total2)
+	}
+}
+
+func TestBlobRefsSkipsSymlinks(t *testing.T) {
+	s := testStore(t)
+	h, _ := s.PutBlob([]byte("target"))
+	_, err := s.CreateSnapshot(nil, []SnapshotFile{
+		{Path: "real.txt", BlobHash: h, Mode: 0644, ModTime: time.Now(), Size: 6, Type: "file"},
+		{Path: "link.txt", BlobHash: h, Mode: 0644, ModTime: time.Now(), Size: 6, Type: "symlink"},
+	}, "mixed")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	refs, err := s.BlobRefs(nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, r := range refs {
+		for _, ref := range r {
+			if ref.Path == "link.txt" {
+				t.Fatal("symlink should be excluded from BlobRefs")
+			}
+			total++
+		}
+	}
+	if total != 1 {
+		t.Fatalf("expected 1 ref (file only), got %d", total)
+	}
+}

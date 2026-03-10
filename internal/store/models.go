@@ -40,3 +40,9 @@ type Checkpoint struct {
 	SnapshotID int64
 	Snapshot   Snapshot
 }
+
+// BlobRef links a blob to a specific snapshot and path.
+type BlobRef struct {
+	SnapshotID int64
+	Path       string
+}

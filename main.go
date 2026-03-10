@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,6 +39,7 @@ var commands = map[string]func([]string) error{
 	"forget":   cmdForget,
 	"check":     cmdCheck,
 	"checks":    cmdChecks,
+	"grep":      cmdGrep,
 	"tui":       cmdTUI,
 	"processes": cmdProcesses,
 	"db":        cmdDB,
@@ -81,6 +83,7 @@ Commands:
   show <hash> [file...]   Show changes in a snapshot, or print file contents
   diff <hash>             Show what a restore would change vs current state
   restore [-y] <hash>     Restore filesystem to a snapshot
+  grep <pattern> [glob]   Search file contents across snapshots
   check [name] [hash]     Create a checkpoint (random name if omitted)
   check -d <name>         Delete a checkpoint
   check -u <name> [hash]  Move a checkpoint to a different snapshot
@@ -1016,6 +1019,209 @@ func cmdDiff(args []string) error {
 		return err
 	}
 	fmt.Print(result)
+	return nil
+}
+
+// GrepMatch represents a single line match from blob content search.
+type GrepMatch struct {
+	SnapshotHash string
+	Path         string
+	LineNum      int
+	Line         string
+}
+
+// grepBlobs searches blob contents for a regex pattern.
+// Returns matches grouped by snapshot (newest-first) then path.
+// Each unique blob is fetched and searched at most once (dedup).
+// maxSize limits the file size to search (0 = no limit).
+func grepBlobs(s *store.Store, pattern *regexp.Regexp, snapshotIDs []int64, fileGlob string, maxSize int64) ([]GrepMatch, error) {
+	refs, err := s.BlobRefs(snapshotIDs, maxSize)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build snapshot ID -> hash lookup
+	snapshots, err := s.ListSnapshots()
+	if err != nil {
+		return nil, err
+	}
+	snapHashByID := make(map[int64]string, len(snapshots))
+	snapOrderByID := make(map[int64]int, len(snapshots))
+	for i, snap := range snapshots {
+		snapHashByID[snap.ID] = snap.Hash
+		snapOrderByID[snap.ID] = i
+	}
+
+	var matches []GrepMatch
+
+	for blobHash, blobRefs := range refs {
+		// Filter by file glob if specified
+		var filteredRefs []store.BlobRef
+		for _, ref := range blobRefs {
+			if fileGlob != "" {
+				matched, _ := filepath.Match(fileGlob, filepath.Base(ref.Path))
+				if !matched {
+					// Also try matching the full path
+					matched, _ = filepath.Match(fileGlob, ref.Path)
+				}
+				if !matched {
+					continue
+				}
+			}
+			filteredRefs = append(filteredRefs, ref)
+		}
+		if len(filteredRefs) == 0 {
+			continue
+		}
+
+		data, err := s.GetBlob(blobHash)
+		if err != nil {
+			continue // skip unreadable blobs
+		}
+		if isBinaryContent(data) {
+			continue
+		}
+
+		// Search line by line
+		lines := strings.Split(string(data), "\n")
+		var lineMatches []struct {
+			num  int
+			line string
+		}
+		for i, line := range lines {
+			if pattern.MatchString(line) {
+				lineMatches = append(lineMatches, struct {
+					num  int
+					line string
+				}{i + 1, line})
+			}
+		}
+		if len(lineMatches) == 0 {
+			continue
+		}
+
+		// Emit matches for every (snapshot, path) that references this blob
+		for _, ref := range filteredRefs {
+			snapHash, ok := snapHashByID[ref.SnapshotID]
+			if !ok {
+				continue
+			}
+			for _, lm := range lineMatches {
+				matches = append(matches, GrepMatch{
+					SnapshotHash: snapHash,
+					Path:         ref.Path,
+					LineNum:      lm.num,
+					Line:         lm.line,
+				})
+			}
+		}
+	}
+
+	// Sort by snapshot order (newest first), then path, then line number
+	sort.Slice(matches, func(i, j int) bool {
+		oi := snapOrderByID[snapIDByHash(snapHashByID, matches[i].SnapshotHash)]
+		oj := snapOrderByID[snapIDByHash(snapHashByID, matches[j].SnapshotHash)]
+		if oi != oj {
+			return oi > oj // newest first (higher index = newer)
+		}
+		if matches[i].Path != matches[j].Path {
+			return matches[i].Path < matches[j].Path
+		}
+		return matches[i].LineNum < matches[j].LineNum
+	})
+
+	return matches, nil
+}
+
+func snapIDByHash(hashToID map[int64]string, hash string) int64 {
+	for id, h := range hashToID {
+		if h == hash {
+			return id
+		}
+	}
+	return 0
+}
+
+func cmdGrep(args []string) error {
+	fs := flag.NewFlagSet("grep", flag.ContinueOnError)
+	caseInsensitive := fs.Bool("i", false, "case-insensitive search")
+	listOnly := fs.Bool("l", false, "list matching files only")
+	limit := fs.Int("n", 0, "limit to N most recent snapshots")
+	maxSizeMB := fs.Int("max-size", 10, "skip files larger than N MB (0 = no limit)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: earwig grep [-i] [-l] [-n count] [-max-size MB] <pattern> [file-glob]")
+	}
+
+	patternStr := fs.Arg(0)
+	if *caseInsensitive {
+		patternStr = "(?i)" + patternStr
+	}
+	re, err := regexp.Compile(patternStr)
+	if err != nil {
+		return fmt.Errorf("invalid pattern: %w", err)
+	}
+
+	fileGlob := ""
+	if fs.NArg() >= 2 {
+		fileGlob = fs.Arg(1)
+	}
+
+	s, _, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	// Determine which snapshots to search
+	var snapshotIDs []int64
+	if *limit > 0 {
+		snapshots, err := s.ListSnapshots()
+		if err != nil {
+			return err
+		}
+		start := len(snapshots) - *limit
+		if start < 0 {
+			start = 0
+		}
+		for i := start; i < len(snapshots); i++ {
+			snapshotIDs = append(snapshotIDs, snapshots[i].ID)
+		}
+	}
+
+	var maxSize int64
+	if *maxSizeMB > 0 {
+		maxSize = int64(*maxSizeMB) * 1024 * 1024
+	}
+
+	matches, err := grepBlobs(s, re, snapshotIDs, fileGlob, maxSize)
+	if err != nil {
+		return err
+	}
+
+	if len(matches) == 0 {
+		fmt.Println("No matches.")
+		return nil
+	}
+
+	if *listOnly {
+		// Deduplicate snapshot:path pairs
+		seen := make(map[string]bool)
+		for _, m := range matches {
+			key := shortHash(m.SnapshotHash) + "  " + m.Path
+			if !seen[key] {
+				seen[key] = true
+				fmt.Println(key)
+			}
+		}
+		return nil
+	}
+
+	for _, m := range matches {
+		fmt.Printf("%s  %s:%d:  %s\n", shortHash(m.SnapshotHash), m.Path, m.LineNum, m.Line)
+	}
 	return nil
 }
 

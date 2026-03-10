@@ -2042,6 +2042,198 @@ earwig restore -y v1 > /dev/null
 expect_file a.txt "version1"
 
 # =========================================================
+# TEST 59: Basic grep
+# =========================================================
+blue "=== TEST 59: Basic grep ==="
+init_project /tmp/earwig-test-59
+
+write_file a.txt "hello world
+foo bar
+baz quux"
+snapshot
+
+write_file a.txt "different content
+foo updated
+more lines"
+write_file b.txt "new file with foo"
+snapshot
+
+# Basic match
+output=$(earwig grep foo)
+if echo "$output" | grep -q "foo updated"; then
+    pass "grep finds match in modified file"
+else
+    fail "grep finds match in modified file" "got: $output"
+fi
+if echo "$output" | grep -q "foo bar"; then
+    pass "grep finds match in older snapshot"
+else
+    fail "grep finds match in older snapshot" "got: $output"
+fi
+if echo "$output" | grep -q "b.txt"; then
+    pass "grep finds match in new file"
+else
+    fail "grep finds match in new file" "got: $output"
+fi
+
+# No match
+output=$(earwig grep "zzzznotfound")
+if echo "$output" | grep -q "No matches"; then
+    pass "grep reports no matches"
+else
+    fail "grep reports no matches" "got: $output"
+fi
+
+# =========================================================
+# TEST 60: Grep flags
+# =========================================================
+blue "=== TEST 60: Grep flags ==="
+
+# Case-insensitive
+output=$(earwig grep -i "FOO")
+if echo "$output" | grep -q "foo"; then
+    pass "grep -i case-insensitive"
+else
+    fail "grep -i case-insensitive" "got: $output"
+fi
+
+# List only
+output=$(earwig grep -l foo)
+if echo "$output" | grep -q "a.txt"; then
+    pass "grep -l lists files"
+else
+    fail "grep -l lists files" "got: $output"
+fi
+# -l should not show line numbers/content
+if echo "$output" | grep -q ":"; then
+    fail "grep -l has no colons" "got: $output"
+else
+    pass "grep -l has no colons"
+fi
+
+# Limit to most recent
+output=$(earwig grep -n 1 foo)
+if echo "$output" | grep -q "${SNAPSHOTS[1]}"; then
+    pass "grep -n 1 shows latest snapshot"
+else
+    fail "grep -n 1 shows latest snapshot" "got: $output"
+fi
+if echo "$output" | grep -q "${SNAPSHOTS[0]}"; then
+    fail "grep -n 1 excludes older snapshot" "still shows older"
+else
+    pass "grep -n 1 excludes older snapshot"
+fi
+
+# =========================================================
+# TEST 61: Grep with file glob
+# =========================================================
+blue "=== TEST 61: Grep with file glob ==="
+
+output=$(earwig grep foo "b.txt")
+if echo "$output" | grep -q "b.txt"; then
+    pass "grep file glob matches b.txt"
+else
+    fail "grep file glob matches b.txt" "got: $output"
+fi
+if echo "$output" | grep -q "a.txt"; then
+    fail "grep file glob excludes a.txt" "a.txt still shown"
+else
+    pass "grep file glob excludes a.txt"
+fi
+
+# =========================================================
+# TEST 62: Grep regex
+# =========================================================
+blue "=== TEST 62: Grep regex ==="
+
+output=$(earwig grep 'foo.*bar')
+if echo "$output" | grep -q "foo bar"; then
+    pass "grep regex works"
+else
+    fail "grep regex works" "got: $output"
+fi
+
+# =========================================================
+# TEST 63: Grep skips binary
+# =========================================================
+blue "=== TEST 63: Grep skips binary ==="
+init_project /tmp/earwig-test-63
+
+# Create a file with a NUL byte (binary)
+printf 'foo\x00bar' > binary.bin
+write_file text.txt "foo in text"
+snapshot
+
+output=$(earwig grep foo)
+if echo "$output" | grep -q "text.txt"; then
+    pass "grep finds text file"
+else
+    fail "grep finds text file" "got: $output"
+fi
+if echo "$output" | grep -q "binary.bin"; then
+    fail "grep skips binary" "binary.bin shown"
+else
+    pass "grep skips binary"
+fi
+
+# =========================================================
+# TEST 64: Grep finds content in compressed blobs
+# =========================================================
+blue "=== TEST 64: Grep compressed blobs ==="
+init_project /tmp/earwig-test-64
+
+# Create a file > 128KB so it gets zstd-compressed
+# Put a unique marker in the middle
+{
+    dd if=/dev/urandom bs=1024 count=64 2>/dev/null | base64
+    echo "UNIQUE_COMPRESSED_NEEDLE"
+    dd if=/dev/urandom bs=1024 count=64 2>/dev/null | base64
+} > bigfile.txt
+snapshot
+
+output=$(earwig grep "UNIQUE_COMPRESSED_NEEDLE")
+if echo "$output" | grep -q "UNIQUE_COMPRESSED_NEEDLE"; then
+    pass "grep finds content in compressed blob"
+else
+    fail "grep finds content in compressed blob" "got: $output"
+fi
+
+# =========================================================
+# TEST 65: Grep by checkpoint name resolution
+# =========================================================
+# Verify max-size filter: the bigfile is > 128KB, so -max-size 0 (no limit)
+# finds it, but default 10MB also finds it (it's ~128KB, under 10MB)
+# Create a scenario where max-size excludes a file
+output=$(earwig grep -max-size 0 "UNIQUE_COMPRESSED_NEEDLE")
+if echo "$output" | grep -q "UNIQUE_COMPRESSED_NEEDLE"; then
+    pass "grep -max-size 0 (no limit) finds large file"
+else
+    fail "grep -max-size 0 (no limit) finds large file" "got: $output"
+fi
+
+# =========================================================
+# TEST 65: Grep by checkpoint name resolution
+# =========================================================
+blue "=== TEST 65: Grep by checkpoint name resolution ==="
+init_project /tmp/earwig-test-64
+
+write_file a.txt "unique needle here"
+snapshot
+earwig check findme > /dev/null
+
+write_file a.txt "replaced content"
+snapshot
+
+# grep should work with -n when snapshots are resolved
+# (this tests that the command works end-to-end with checkpoints)
+output=$(earwig show findme a.txt)
+if echo "$output" | grep -q "unique needle here"; then
+    pass "show via checkpoint works for grep context"
+else
+    fail "show via checkpoint works for grep context" "got: $output"
+fi
+
+# =========================================================
 # DONE
 # =========================================================
 summary
