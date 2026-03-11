@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -20,6 +21,14 @@ type diffMode int
 const (
 	vsFilesystem diffMode = iota
 	vsParent
+)
+
+// Search modes
+type searchMode int
+
+const (
+	searchFilename searchMode = iota
+	searchContent
 )
 
 // Pane focus
@@ -86,9 +95,14 @@ type tuiModel struct {
 
 	// Search/filter
 	searchActive bool
+	searchMode   searchMode // current search type (filename or content)
 	searchInput  textinput.Model
 	filterQuery  string
-	filtered     []int // nil = show all; indices into snapshots
+	filterMode   searchMode // what type of filter is active
+	filtered     []int      // nil = show all; indices into snapshots
+
+	// Content search state
+	contentSearching bool // true while async content search runs
 
 	// Layout
 	focus        pane
@@ -103,6 +117,12 @@ type diffComputedMsg struct {
 	content string
 	err     error
 	snapID  int64 // to discard stale results
+}
+
+type contentSearchMsg struct {
+	indices []int  // matching snapshot indices (into m.snapshots)
+	err     error
+	query   string
 }
 
 func cmdTUI(args []string) error {
@@ -212,6 +232,27 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.diffViewport.SetContent(m.diffContent)
 		m.diffViewport.GotoTop()
 		return m, nil
+
+	case contentSearchMsg:
+		m.contentSearching = false
+		if msg.err != nil {
+			m.diffContent = errorStyle.Render("Search error: " + msg.err.Error())
+			m.diffViewport.SetContent(m.diffContent)
+			m.diffViewport.GotoTop()
+			return m, nil
+		}
+		m.filterQuery = msg.query
+		m.filterMode = searchContent
+		m.filtered = msg.indices
+		m.cursor = 0
+		m.listOffset = 0
+		if m.listLen() > 0 {
+			return m, m.computeDiff()
+		}
+		m.diffContent = "No matches found."
+		m.diffViewport.SetContent(m.diffContent)
+		m.diffViewport.GotoTop()
+		return m, nil
 	}
 	return m, nil
 }
@@ -252,6 +293,14 @@ func (m tuiModel) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.toggleDiffMode()
 		case "/":
 			m.searchActive = true
+			m.searchMode = searchFilename
+			m.searchInput.Placeholder = "filename..."
+			m.searchInput.Focus()
+			return m, textinput.Blink
+		case "?":
+			m.searchActive = true
+			m.searchMode = searchContent
+			m.searchInput.Placeholder = "content pattern..."
 			m.searchInput.Focus()
 			return m, textinput.Blink
 		case "esc":
@@ -313,6 +362,14 @@ func (m tuiModel) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.toggleDiffMode()
 	case "/":
 		m.searchActive = true
+		m.searchMode = searchFilename
+		m.searchInput.Placeholder = "filename..."
+		m.searchInput.Focus()
+		return m, textinput.Blink
+	case "?":
+		m.searchActive = true
+		m.searchMode = searchContent
+		m.searchInput.Placeholder = "content pattern..."
 		m.searchInput.Focus()
 		return m, textinput.Blink
 	}
@@ -323,17 +380,38 @@ func (m tuiModel) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
 		query := m.searchInput.Value()
+		m.searchActive = false
+		m.searchInput.Blur()
+		m.searchInput.SetValue("")
 		if query == "" {
 			// Empty search clears filter
 			m.filtered = nil
 			m.filterQuery = ""
-		} else {
-			m.filterQuery = query
-			m.filtered = m.filterSnapshots(query)
+			m.cursor = 0
+			m.listOffset = 0
+			if m.listLen() > 0 {
+				return m, m.computeDiff()
+			}
+			m.diffContent = ""
+			m.diffViewport.SetContent("")
+			return m, nil
 		}
-		m.searchActive = false
-		m.searchInput.Blur()
-		m.searchInput.SetValue("")
+		if m.searchMode == searchContent {
+			// Compile regex
+			re, err := regexp.Compile(query)
+			if err != nil {
+				m.diffContent = errorStyle.Render("Invalid pattern: " + err.Error())
+				m.diffViewport.SetContent(m.diffContent)
+				m.diffViewport.GotoTop()
+				return m, nil
+			}
+			m.contentSearching = true
+			return m, m.searchContentCmd(re, query)
+		}
+		// Filename search
+		m.filterQuery = query
+		m.filterMode = searchFilename
+		m.filtered = m.filterSnapshots(query)
 		m.cursor = 0
 		m.listOffset = 0
 		if m.listLen() > 0 {
@@ -431,6 +509,35 @@ func (m *tuiModel) ensureCursorVisible() {
 	}
 	if m.cursor >= m.listOffset+m.topHeight {
 		m.listOffset = m.cursor - m.topHeight + 1
+	}
+}
+
+// searchContentCmd returns a tea.Cmd that greps blob contents for matching snapshots.
+func (m tuiModel) searchContentCmd(re *regexp.Regexp, query string) tea.Cmd {
+	s := m.store
+	snapshots := m.snapshots
+
+	return func() tea.Msg {
+		matches, err := grepBlobs(s, re, nil, "", 10*1024*1024)
+		if err != nil {
+			return contentSearchMsg{err: err, query: query}
+		}
+
+		// Collect unique snapshot hashes that have matches
+		matchHashes := make(map[string]bool)
+		for _, m := range matches {
+			matchHashes[m.SnapshotHash] = true
+		}
+
+		// Map to snapshot indices
+		var indices []int
+		for i, snap := range snapshots {
+			if matchHashes[snap.Hash] {
+				indices = append(indices, i)
+			}
+		}
+
+		return contentSearchMsg{indices: indices, query: query}
 	}
 }
 
@@ -536,7 +643,11 @@ func (m tuiModel) renderSeparator() string {
 
 	filterHint := ""
 	if m.filterQuery != "" {
-		filterHint = fmt.Sprintf(" [filter: %s]", m.filterQuery)
+		if m.filterMode == searchContent {
+			filterHint = fmt.Sprintf(" [content: %s]", m.filterQuery)
+		} else {
+			filterHint = fmt.Sprintf(" [filter: %s]", m.filterQuery)
+		}
 	}
 
 	left := "──" + label + "──"
@@ -550,15 +661,18 @@ func (m tuiModel) renderSeparator() string {
 }
 
 func (m tuiModel) renderStatusBar() string {
+	if m.contentSearching {
+		return statusStyle.Render(pad("  Searching content...", m.width))
+	}
 	if m.diffLoading {
 		return statusStyle.Render(pad("  Computing diff...", m.width))
 	}
 
 	var parts []string
 	if m.focus == topPane {
-		parts = append(parts, "j/k:navigate", "enter/tab:focus diff", "t:toggle mode", "/:search", "q:quit")
+		parts = append(parts, "j/k:navigate", "enter/tab:focus diff", "t:toggle mode", "/:search", "?:content", "q:quit")
 	} else {
-		parts = append(parts, "j/k:scroll", "tab:focus list", "t:toggle mode", "/:search", "q:quit")
+		parts = append(parts, "j/k:scroll", "tab:focus list", "t:toggle mode", "/:search", "?:content", "q:quit")
 	}
 
 	text := "  " + strings.Join(parts, "  ")
@@ -566,7 +680,11 @@ func (m tuiModel) renderStatusBar() string {
 }
 
 func (m tuiModel) renderSearchBar() string {
-	label := searchLabelStyle.Render("/")
+	labelChar := "/"
+	if m.searchMode == searchContent {
+		labelChar = "?"
+	}
+	label := searchLabelStyle.Render(labelChar)
 	input := m.searchInput.View()
 	line := label + input
 	padLen := m.width - lipgloss.Width(line)

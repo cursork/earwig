@@ -272,6 +272,62 @@ tui_start /tmp/earwig-tui-9
 expect_screen_contains "(my-mark)" "checkpoint name in TUI"
 
 # =========================================================
+# TEST TUI-10: Content search (?)
+# =========================================================
+blue "=== TUI TEST 10: Content search ==="
+
+tui_stop
+
+init_project /tmp/earwig-tui-10
+write_file alpha.txt "the quick brown fox"
+snapshot  # #1: A alpha.txt (has "quick brown")
+
+write_file alpha.txt "something else entirely"
+snapshot  # #2: M alpha.txt (no longer has "quick brown")
+
+write_file beta.txt "another file"
+snapshot  # #3: A beta.txt (alpha still "something else")
+
+SHASH1="${SNAPSHOTS[0]}"
+SHASH2="${SNAPSHOTS[1]}"
+SHASH3="${SNAPSHOTS[2]}"
+
+tui_start /tmp/earwig-tui-10
+
+# Search for content that only exists in snapshot #1's alpha.txt
+tui_send ?
+sleep 0.5
+tmux send-keys -t "$SESSION" "quick brown"
+sleep 0.5
+
+# Search bar shows ? prompt
+expect_screen_contains "quick brown" "content search input"
+
+tui_send Enter
+sleep 2  # content search is async
+
+# Only snapshot #1 should be visible (it had "quick brown fox")
+expect_screen_contains "$SHASH1" "matching snapshot visible"
+expect_screen_not_contains "$SHASH2" "non-matching snapshot hidden"
+expect_screen_not_contains "$SHASH3" "non-matching snapshot hidden"
+
+# Separator shows content filter label
+expect_screen_contains "[content: quick brown]" "content filter label"
+
+# Status bar shows ?:content hint
+expect_screen_contains "?:content" "content search hint in status"
+
+# Clear filter with Esc
+tui_send Escape
+sleep 1
+
+# All snapshots visible again
+expect_screen_contains "$SHASH1" "all snapshots after clear"
+expect_screen_contains "$SHASH2" "snapshot #2 visible after clear"
+expect_screen_contains "$SHASH3" "snapshot #3 visible after clear"
+expect_screen_not_contains "[content:" "content label removed"
+
+# =========================================================
 # Cleanup
 # =========================================================
 tui_stop

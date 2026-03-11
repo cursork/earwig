@@ -449,7 +449,8 @@ else
 fi
 
 # The watched file should appear in the watcher's initial snapshot
-latest_hash=$(earwig log 2>/dev/null | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}')
+log_tmp=$(earwig log 2>/dev/null)
+latest_hash=$(echo "$log_tmp" | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}')
 files_output=$(earwig _files "$latest_hash" 2>/dev/null)
 if echo "$files_output" | grep -q "watched.txt"; then
     pass "watched.txt appears in watcher snapshot"
@@ -1572,7 +1573,7 @@ init_project /tmp/earwig-test-44
 printf '\x00\x01\x02\x03binary' > bin.dat
 printf 'text content\n' > text.txt
 earwig snapshot > /dev/null
-SNAPSHOTS+=($(earwig log | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
+log_tmp=$(earwig log); SNAPSHOTS+=($(echo "$log_tmp" | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
 
 # Modify both files
 printf '\x00\x01\x02\x03CHANGED' > bin.dat
@@ -1622,7 +1623,7 @@ init_project /tmp/earwig-test-45
 printf 'target content\n' > target.txt
 ln -s target.txt link.txt
 earwig snapshot > /dev/null
-SNAPSHOTS+=($(earwig log | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
+log_tmp=$(earwig log); SNAPSHOTS+=($(echo "$log_tmp" | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
 
 # Change symlink target
 rm link.txt
@@ -1672,7 +1673,7 @@ init_project /tmp/earwig-test-46
 printf 'some content\n' > script.sh
 chmod 755 script.sh
 earwig snapshot > /dev/null
-SNAPSHOTS+=($(earwig log | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
+log_tmp=$(earwig log); SNAPSHOTS+=($(echo "$log_tmp" | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
 
 # Change only permissions, not content
 chmod 644 script.sh
@@ -1709,7 +1710,7 @@ init_project /tmp/earwig-test-47
 
 printf 'real content\n' > target.txt
 earwig snapshot > /dev/null
-SNAPSHOTS+=($(earwig log | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
+log_tmp=$(earwig log); SNAPSHOTS+=($(echo "$log_tmp" | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
 
 # Replace file with symlink
 rm target.txt
@@ -1790,7 +1791,7 @@ fi
 # Show symlink (should print the link target, not followed content)
 ln -s sub/b.txt link.txt
 earwig snapshot > /dev/null
-SNAPSHOTS+=($(earwig log | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
+log_tmp=$(earwig log); SNAPSHOTS+=($(echo "$log_tmp" | awk '/[*]/{sub(/.*[*] /, ""); print $1; exit}'))
 show_link=$(earwig show "${SNAPSHOTS[2]}" link.txt)
 if [ "$show_link" = "sub/b.txt" ]; then
     pass "show symlink prints link target"
