@@ -2235,6 +2235,68 @@ else
 fi
 
 # =========================================================
+# TEST 66: Checkpoint auto-snapshots current state
+# =========================================================
+blue "=== TEST 66: Checkpoint auto-snapshots current state ==="
+init_project /tmp/earwig-test-66
+
+write_file a.txt "first"
+snapshot
+expect_snapshot_count 1
+
+# Make changes but don't snapshot manually
+write_file b.txt "second"
+
+# earwig check should snapshot first, then checkpoint the NEW snapshot
+earwig check snap-now > /tmp/earwig-check-66 2>&1
+output=$(cat /tmp/earwig-check-66)
+
+# Should have printed a Snapshot line (new snapshot was taken)
+if echo "$output" | grep -q "^Snapshot "; then
+    pass "check auto-snapshotted"
+else
+    fail "check auto-snapshotted" "got: $output"
+fi
+
+# Should now have 2 snapshots
+expect_snapshot_count 2
+
+# The checkpoint should be on the NEW snapshot (which has b.txt)
+output=$(earwig show snap-now b.txt)
+if echo "$output" | grep -q "second"; then
+    pass "checkpoint is on new snapshot with b.txt"
+else
+    fail "checkpoint is on new snapshot with b.txt" "got: $output"
+fi
+
+# =========================================================
+# TEST 67: Checkpoint with no changes still checkpoints HEAD
+# =========================================================
+blue "=== TEST 67: Checkpoint with no changes still checkpoints HEAD ==="
+
+# No changes since last snapshot — should NOT create a new snapshot
+earwig check no-change > /tmp/earwig-check-67 2>&1
+output=$(cat /tmp/earwig-check-67)
+
+# Should NOT have a Snapshot line
+if echo "$output" | grep -q "^Snapshot "; then
+    fail "no-change check should not snapshot" "got: $output"
+else
+    pass "no-change check did not snapshot"
+fi
+
+# Still 2 snapshots
+expect_snapshot_count 2
+
+# Both checkpoints should resolve
+output=$(earwig show no-change b.txt)
+if echo "$output" | grep -q "second"; then
+    pass "no-change checkpoint resolves to HEAD"
+else
+    fail "no-change checkpoint resolves to HEAD" "got: $output"
+fi
+
+# =========================================================
 # DONE
 # =========================================================
 summary

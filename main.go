@@ -1280,14 +1280,7 @@ func cmdCheck(args []string) error {
 				return err
 			}
 		} else {
-			headID, err := readHead(root, s)
-			if err != nil {
-				return err
-			}
-			if headID == nil {
-				return fmt.Errorf("no HEAD snapshot")
-			}
-			snap, err = s.GetSnapshotByID(*headID)
+			snap, err = snapshotForCheck(s, root)
 			if err != nil {
 				return err
 			}
@@ -1302,15 +1295,8 @@ func cmdCheck(args []string) error {
 	// Create mode
 	switch fs.NArg() {
 	case 0:
-		// earwig check — random name on HEAD
-		headID, err := readHead(root, s)
-		if err != nil {
-			return err
-		}
-		if headID == nil {
-			return fmt.Errorf("no HEAD snapshot")
-		}
-		snap, err := s.GetSnapshotByID(*headID)
+		// earwig check — random name, snapshot first
+		snap, err := snapshotForCheck(s, root)
 		if err != nil {
 			return err
 		}
@@ -1334,19 +1320,12 @@ func cmdCheck(args []string) error {
 		return fmt.Errorf("could not generate a unique checkpoint name after 20 attempts")
 
 	case 1:
-		// earwig check <name> — named checkpoint on HEAD
+		// earwig check <name> — named checkpoint, snapshot first
 		name := fs.Arg(0)
 		if err := validateCheckpointName(name); err != nil {
 			return err
 		}
-		headID, err := readHead(root, s)
-		if err != nil {
-			return err
-		}
-		if headID == nil {
-			return fmt.Errorf("no HEAD snapshot")
-		}
-		snap, err := s.GetSnapshotByID(*headID)
+		snap, err := snapshotForCheck(s, root)
 		if err != nil {
 			return err
 		}
@@ -1375,6 +1354,36 @@ func cmdCheck(args []string) error {
 	default:
 		return fmt.Errorf("usage: earwig check [name] [hash]")
 	}
+}
+
+// snapshotForCheck takes a snapshot of the current filesystem state.
+// If there are changes, returns the new snapshot. If no changes, returns HEAD.
+func snapshotForCheck(s *store.Store, root string) (*store.Snapshot, error) {
+	ig, err := loadIgnore(root)
+	if err != nil {
+		return nil, err
+	}
+	parentID, err := readHead(root, s)
+	if err != nil {
+		return nil, err
+	}
+	c := snapshot.NewCreator(s, root, ig)
+	snap, err := c.TakeSnapshot(parentID, "check")
+	if err != nil {
+		return nil, err
+	}
+	if snap != nil {
+		if err := writeHead(root, snap.ID); err != nil {
+			return nil, fmt.Errorf("writing HEAD: %w", err)
+		}
+		fmt.Printf("Snapshot %s\n", shortHash(snap.Hash))
+		return snap, nil
+	}
+	// No changes — checkpoint HEAD
+	if parentID == nil {
+		return nil, fmt.Errorf("no snapshots yet")
+	}
+	return s.GetSnapshotByID(*parentID)
 }
 
 func cmdChecks(args []string) error {

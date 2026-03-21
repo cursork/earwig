@@ -492,19 +492,66 @@ func (h *Harness) opGC() {
 }
 
 func (h *Harness) opCheckpoint() {
-	if len(h.snapshots) == 0 {
-		return
-	}
-
-	// Pick a random snapshot to checkpoint
-	idx := h.rng.Intn(len(h.snapshots))
 	name := fmt.Sprintf("check-%d-%d", h.opCounts["checkpoint"], h.rng.Intn(1000))
-	snap := h.snapshots[idx]
 
-	h.earwig("check", name, snap.hash)
-	fmt.Printf("  checkpoint %s -> #%d (%s)\n", name, idx+1, snap.hash)
+	// 50% of the time: use the no-hash path (earwig check <name>),
+	// which auto-snapshots if there are pending changes.
+	if h.rng.Intn(2) == 0 && len(h.snapshots) > 0 {
+		// Explicit hash path: pick a random snapshot
+		idx := h.rng.Intn(len(h.snapshots))
+		snap := h.snapshots[idx]
 
-	h.checkpoints[name] = idx
+		h.earwig("check", name, snap.hash)
+		fmt.Printf("  checkpoint %s -> #%d (%s)\n", name, idx+1, snap.hash)
+		h.checkpoints[name] = idx
+	} else {
+		// No-hash path: earwig check <name> — auto-snapshots current state
+		output := h.earwig("check", name)
+
+		if strings.Contains(output, "Snapshot ") {
+			// A new snapshot was created — parse hash and track it
+			lines := strings.Split(strings.TrimSpace(output), "\n")
+			hash := ""
+			for _, line := range lines {
+				if strings.HasPrefix(line, "Snapshot ") {
+					hash = strings.TrimSpace(strings.TrimPrefix(line, "Snapshot "))
+					break
+				}
+			}
+			h.snapshots = append(h.snapshots, SavedSnapshot{
+				hash:  hash,
+				model: h.model.clone(),
+			})
+			h.headHash = hash
+			idx := len(h.snapshots) - 1
+			h.checkpoints[name] = idx
+			fmt.Printf("  checkpoint %s (auto-snapshot #%d: %s)\n", name, idx+1, hash)
+
+			h.verify(fmt.Sprintf("after checkpoint auto-snapshot #%d", idx+1))
+			h.verifyDiff(hash)
+		} else {
+			// No changes — checkpointed HEAD
+			if len(h.snapshots) == 0 {
+				fmt.Printf("  checkpoint %s skipped (no snapshots)\n", name)
+				return
+			}
+			// Find the snapshot matching headHash
+			idx := -1
+			for i, s := range h.snapshots {
+				if s.hash == h.headHash {
+					idx = i
+					break
+				}
+			}
+			if idx == -1 {
+				// HEAD might not be in our tracked list (e.g. after restore created a pre-restore snapshot)
+				// Just use the last snapshot index
+				idx = len(h.snapshots) - 1
+			}
+			h.checkpoints[name] = idx
+			fmt.Printf("  checkpoint %s -> HEAD #%d (%s) (no changes)\n", name, idx+1, h.headHash)
+		}
+	}
 
 	// Verify it shows up in earwig checks
 	output := h.earwig("checks")
@@ -516,10 +563,12 @@ func (h *Harness) opCheckpoint() {
 	}
 
 	// Verify it resolves via earwig show
+	expectedIdx := h.checkpoints[name]
+	expectedHash := h.snapshots[expectedIdx].hash
 	output = h.earwig("show", name)
-	if !strings.Contains(output, snap.hash) {
+	if !strings.Contains(output, expectedHash) {
 		h.fail++
-		fmt.Printf("    FAIL: checkpoint %s doesn't resolve to %s\n", name, snap.hash)
+		fmt.Printf("    FAIL: checkpoint %s doesn't resolve to %s\n", name, expectedHash)
 	} else {
 		h.pass++
 	}
@@ -576,6 +625,136 @@ func (h *Harness) opCheckpointRestore() {
 
 	// Diff check: restored snapshot should match filesystem exactly
 	h.verifyDiff(snap.hash)
+}
+
+func (h *Harness) opCheckpointRandom() {
+	// earwig check — no name, no hash (case 0)
+	output := h.earwig("check")
+
+	// Parse "Checkpoint <name> -> <hash>"
+	var name, hash string
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		if strings.HasPrefix(line, "Checkpoint ") {
+			parts := strings.Fields(line)
+			if len(parts) >= 4 {
+				name = parts[1]
+				hash = parts[3]
+			}
+		}
+		if strings.HasPrefix(line, "Snapshot ") {
+			snapHash := strings.TrimSpace(strings.TrimPrefix(line, "Snapshot "))
+			h.snapshots = append(h.snapshots, SavedSnapshot{
+				hash:  snapHash,
+				model: h.model.clone(),
+			})
+			h.headHash = snapHash
+			fmt.Printf("  checkpoint random (auto-snapshot #%d: %s)\n", len(h.snapshots), snapHash)
+			h.verify(fmt.Sprintf("after checkpoint_random auto-snapshot #%d", len(h.snapshots)))
+			h.verifyDiff(snapHash)
+		}
+	}
+
+	if name == "" {
+		fmt.Printf("  checkpoint random skipped (no output)\n")
+		return
+	}
+
+	// Find the snapshot index for this hash
+	idx := -1
+	for i, s := range h.snapshots {
+		if s.hash == hash {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		idx = len(h.snapshots) - 1
+	}
+	h.checkpoints[name] = idx
+	fmt.Printf("  checkpoint random %s -> #%d (%s)\n", name, idx+1, hash)
+
+	// Verify it shows up
+	checksOutput := h.earwig("checks")
+	if !strings.Contains(checksOutput, name) {
+		h.fail++
+		fmt.Printf("    FAIL: random checkpoint %s not in 'earwig checks' output\n", name)
+	} else {
+		h.pass++
+	}
+}
+
+func (h *Harness) opCheckpointMove() {
+	if len(h.checkpoints) == 0 {
+		return
+	}
+
+	// Pick a random existing checkpoint to move
+	var names []string
+	for n := range h.checkpoints {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	name := names[h.rng.Intn(len(names))]
+
+	// 50%: move to explicit hash, 50%: move to current state (no hash — auto-snapshots)
+	if h.rng.Intn(2) == 0 && len(h.snapshots) > 0 {
+		idx := h.rng.Intn(len(h.snapshots))
+		snap := h.snapshots[idx]
+		h.earwig("check", "-u", name, snap.hash)
+		h.checkpoints[name] = idx
+		fmt.Printf("  checkpoint move %s -> #%d (%s)\n", name, idx+1, snap.hash)
+	} else {
+		output := h.earwig("check", "-u", name)
+
+		if strings.Contains(output, "Snapshot ") {
+			// Auto-snapshot happened
+			for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+				if strings.HasPrefix(line, "Snapshot ") {
+					snapHash := strings.TrimSpace(strings.TrimPrefix(line, "Snapshot "))
+					h.snapshots = append(h.snapshots, SavedSnapshot{
+						hash:  snapHash,
+						model: h.model.clone(),
+					})
+					h.headHash = snapHash
+					idx := len(h.snapshots) - 1
+					h.checkpoints[name] = idx
+					fmt.Printf("  checkpoint move %s (auto-snapshot #%d: %s)\n", name, idx+1, snapHash)
+					h.verify(fmt.Sprintf("after checkpoint_move auto-snapshot #%d", idx+1))
+					h.verifyDiff(snapHash)
+					break
+				}
+			}
+		} else {
+			// Moved to HEAD
+			if len(h.snapshots) == 0 {
+				fmt.Printf("  checkpoint move %s skipped (no snapshots)\n", name)
+				return
+			}
+			idx := -1
+			for i, s := range h.snapshots {
+				if s.hash == h.headHash {
+					idx = i
+					break
+				}
+			}
+			if idx == -1 {
+				idx = len(h.snapshots) - 1
+			}
+			h.checkpoints[name] = idx
+			fmt.Printf("  checkpoint move %s -> HEAD #%d (%s) (no changes)\n", name, idx+1, h.headHash)
+		}
+	}
+
+	// Verify the checkpoint resolves correctly
+	expectedIdx := h.checkpoints[name]
+	expectedHash := h.snapshots[expectedIdx].hash
+	output := h.earwig("show", name)
+	if !strings.Contains(output, expectedHash) {
+		h.fail++
+		fmt.Printf("    FAIL: checkpoint %s doesn't resolve to %s after move\n", name, expectedHash)
+	} else {
+		h.pass++
+	}
 }
 
 // ── helpers ────────────────────────────────────────────
@@ -851,6 +1030,8 @@ func main() {
 		{3, "forget", h.opForget},
 		{2, "gc", h.opGC},
 		{2, "checkpoint", h.opCheckpoint},
+		{1, "checkpoint_random", h.opCheckpointRandom},
+		{1, "checkpoint_move", h.opCheckpointMove},
 		{1, "checkpoint_delete", h.opCheckpointDelete},
 		{2, "checkpoint_restore", h.opCheckpointRestore},
 	}
