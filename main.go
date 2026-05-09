@@ -183,6 +183,8 @@ func cmdInit(args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: closing database: %v\n", err)
 	}
 
+	addToGitExclude(cwd)
+
 	fmt.Printf("Initialized earwig in %s\n", cwd)
 	return nil
 }
@@ -1838,4 +1840,55 @@ func processCwd(pid int) string {
 		}
 	}
 	return ""
+}
+
+func addToGitExclude(dir string) {
+	gitDir := filepath.Join(dir, ".git")
+	if info, err := os.Stat(gitDir); err != nil || !info.IsDir() {
+		return
+	}
+
+	excludeFile := filepath.Join(gitDir, "info", "exclude")
+	existing, err := os.ReadFile(excludeFile)
+	if err != nil {
+		return
+	}
+
+	for _, line := range strings.Split(string(existing), "\n") {
+		if strings.TrimRight(line, "\r") == ".earwig" {
+			return
+		}
+	}
+
+	fmt.Printf("Add .earwig to %s? [Y/n] ", excludeFile)
+	reader := bufio.NewReader(os.Stdin)
+	answer, err := reader.ReadString('\n')
+	if err != nil {
+		return
+	}
+	answer = strings.TrimSpace(strings.ToLower(answer))
+	if answer != "" && answer != "y" && answer != "yes" {
+		return
+	}
+
+	f, err := os.OpenFile(excludeFile, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not open %s: %v\n", excludeFile, err)
+		return
+	}
+	defer f.Close()
+
+	if len(existing) > 0 && existing[len(existing)-1] != '\n' {
+		if _, err := f.WriteString("\n"); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not write to %s: %v\n", excludeFile, err)
+			return
+		}
+	}
+
+	if _, err := f.WriteString(".earwig\n"); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not write to %s: %v\n", excludeFile, err)
+		return
+	}
+
+	fmt.Printf("Added .earwig to %s\n", excludeFile)
 }
