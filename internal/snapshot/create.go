@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
+	"github.com/nk/earwig/internal/config"
 	"github.com/nk/earwig/internal/ignore"
 	"github.com/nk/earwig/internal/store"
 )
@@ -21,10 +23,43 @@ type Creator struct {
 	store   *store.Store
 	rootDir string
 	ignore  *ignore.Matcher
+	config  *config.Config
+
+	warnMu       sync.Mutex
+	warnedSizes  map[string]int64 // path -> size at which we last warned
 }
 
-func NewCreator(s *store.Store, rootDir string, ig *ignore.Matcher) *Creator {
-	return &Creator{store: s, rootDir: rootDir, ignore: ig}
+func NewCreator(s *store.Store, rootDir string, ig *ignore.Matcher, cfg *config.Config) *Creator {
+	if cfg == nil {
+		cfg = config.Default()
+	}
+	return &Creator{
+		store:       s,
+		rootDir:     rootDir,
+		ignore:      ig,
+		config:      cfg,
+		warnedSizes: make(map[string]int64),
+	}
+}
+
+// maybeWarnSize prints a stderr warning when relPath exceeds its configured
+// threshold. Dedupes per path within this Creator; re-warns only when the file
+// has grown past the previously-warned size.
+func (c *Creator) maybeWarnSize(relPath string, size int64) {
+	threshold := c.config.SizeWarnThreshold(relPath)
+	if threshold < 0 || size < threshold {
+		return
+	}
+	c.warnMu.Lock()
+	prev, seen := c.warnedSizes[relPath]
+	if seen && size <= prev {
+		c.warnMu.Unlock()
+		return
+	}
+	c.warnedSizes[relPath] = size
+	c.warnMu.Unlock()
+	fmt.Fprintf(os.Stderr, "warning: %s is %.1f MB (threshold %.1f MB); add an override in .earwig/config.json or set 'off' to silence\n",
+		relPath, float64(size)/(1024*1024), float64(threshold)/(1024*1024))
 }
 
 // TakeSnapshot walks the directory, hashes and stores all non-ignored files,
@@ -236,6 +271,8 @@ func (c *Creator) readFile(absPath, relPath string) (store.SnapshotFile, error) 
 	if maxFileSize >= 0 && info.Size() > maxFileSize {
 		return store.SnapshotFile{}, fmt.Errorf("file too large: %s (%.1f MB)", relPath, float64(info.Size())/(1024*1024))
 	}
+
+	c.maybeWarnSize(relPath, info.Size())
 
 	data, err := io.ReadAll(f)
 	if err != nil {

@@ -127,8 +127,33 @@ All data lives in `.earwig/` within the watched directory:
 - `HEAD` — current snapshot ID
 - `flock` — file lock for mutual exclusion between watcher and restore
 - `ignore` — custom ignore patterns (gitignore syntax)
+- `config.json` — optional JSON config (see below)
 
 earwig respects `.gitignore` and always ignores `.earwig/` and `.git/`.
+
+### `config.json`
+
+Optional. Currently controls per-path size warnings: earwig prints a stderr
+warning when a snapshotted file exceeds the threshold (the file is still
+included). Default is 100MB.
+
+```json
+{
+  "sizeWarn": {
+    "default": "100MB",
+    "overrides": {
+      "test-reports/": "500MB",
+      "vendor/": "off",
+      "aplcore": "off"
+    }
+  }
+}
+```
+
+Sizes accept `B`, `KB`, `MB`, `GB` (or a bare number for bytes). `"off"` disables
+the warning for that pattern. Override keys use gitignore-style patterns; the
+last matching override wins. Warnings dedupe per-path within a watcher process
+and re-fire only when the file has grown past the previously-warned size.
 
 ## Safety
 

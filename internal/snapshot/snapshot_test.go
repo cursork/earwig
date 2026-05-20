@@ -38,7 +38,7 @@ func TestTakeSnapshot(t *testing.T) {
 	writeFile(t, dir, "sub/b.txt", "world")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 
 	snap, err := c.TakeSnapshot(nil, "test")
 	if err != nil {
@@ -68,7 +68,7 @@ func TestSnapshotDedup(t *testing.T) {
 	writeFile(t, dir, "b.txt", "same content")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 
 	snap, _ := c.TakeSnapshot(nil, "test")
 	files, _ := s.GetSnapshotFiles(snap.ID)
@@ -85,7 +85,7 @@ func TestSnapshotIgnoresEarwig(t *testing.T) {
 	writeFile(t, dir, ".git/config", "should be ignored")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 
 	snap, _ := c.TakeSnapshot(nil, "test")
 	files, _ := s.GetSnapshotFiles(snap.ID)
@@ -107,7 +107,7 @@ func TestSnapshotIgnoresCustomPatterns(t *testing.T) {
 	writeFile(t, dir, filepath.Join(".earwig", "ignore"), "*.log\n")
 
 	ig, _ := ignore.New([]string{filepath.Join(earwigDir, "ignore")})
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 
 	snap, _ := c.TakeSnapshot(nil, "test")
 	files, _ := s.GetSnapshotFiles(snap.ID)
@@ -126,7 +126,7 @@ func TestSkipIdenticalSnapshot(t *testing.T) {
 	writeFile(t, dir, "a.txt", "hello")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 
 	snap1, _ := c.TakeSnapshot(nil, "first")
 	snap2, err := c.TakeSnapshot(&snap1.ID, "second")
@@ -143,7 +143,7 @@ func TestSnapshotDetectsChanges(t *testing.T) {
 	writeFile(t, dir, "a.txt", "hello")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 
 	snap1, _ := c.TakeSnapshot(nil, "first")
 
@@ -167,7 +167,7 @@ func TestIncrementalSnapshotModify(t *testing.T) {
 	writeFile(t, dir, "b.txt", "world")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 
 	snap1, _ := c.TakeSnapshot(nil, "first")
 
@@ -212,7 +212,7 @@ func TestIncrementalSnapshotDelete(t *testing.T) {
 	writeFile(t, dir, "b.txt", "world")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 
 	snap1, _ := c.TakeSnapshot(nil, "first")
 
@@ -243,7 +243,7 @@ func TestIncrementalSnapshotDeleteDir(t *testing.T) {
 	writeFile(t, dir, "sub/c.txt", "foo")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 
 	snap1, _ := c.TakeSnapshot(nil, "first")
 
@@ -273,7 +273,7 @@ func TestIncrementalSnapshotNoChange(t *testing.T) {
 	writeFile(t, dir, "a.txt", "hello")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 
 	snap1, _ := c.TakeSnapshot(nil, "first")
 
@@ -293,7 +293,7 @@ func TestRestoreSkipsUnchangedFiles(t *testing.T) {
 	writeFile(t, dir, "b.txt", "unchanged")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap1, _ := c.TakeSnapshot(nil, "first")
 
 	// Modify a.txt, leave b.txt alone
@@ -358,7 +358,7 @@ func TestRestoreRejectsTraversalPaths(t *testing.T) {
 	writeFile(t, dir, "a.txt", "legit")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap, _ := c.TakeSnapshot(nil, "first")
 
 	// Manually insert a malicious snapshot with a ".." path
@@ -392,7 +392,7 @@ func TestIncrementalSnapshotRejectsTraversalPaths(t *testing.T) {
 	writeFile(t, dir, "a.txt", "hello")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap, _ := c.TakeSnapshot(nil, "first")
 
 	// Try an incremental snapshot with a malicious changedPaths entry
@@ -414,7 +414,7 @@ func TestRestoreRemovesSymlinkAtFilePath(t *testing.T) {
 	writeFile(t, dir, "a.txt", "original")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap, _ := c.TakeSnapshot(nil, "first")
 
 	// Create a canary file outside the root and replace a.txt with a symlink to it
@@ -456,7 +456,7 @@ func TestRestoreRemovesSymlinkInDirPath(t *testing.T) {
 	writeFile(t, dir, "sub/a.txt", "original")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap, _ := c.TakeSnapshot(nil, "first")
 
 	// Replace the "sub" directory with a symlink to an outside directory
@@ -504,7 +504,7 @@ func TestSymlinkRoundTrip(t *testing.T) {
 	os.Symlink(target, filepath.Join(dir, "link.txt"))
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 
 	// Snapshot should capture both the file and the symlink
 	snap, err := c.TakeSnapshot(nil, "with-symlink")
@@ -586,7 +586,7 @@ func TestRestoreRegularFileToSymlink(t *testing.T) {
 	writeFile(t, dir, "target.txt", "regular content")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap1, err := c.TakeSnapshot(nil, "as-file")
 	if err != nil {
 		t.Fatal(err)
@@ -637,7 +637,7 @@ func TestRestoreOverwritesReadOnlyFile(t *testing.T) {
 	writeFile(t, dir, "ro.txt", "version1")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap1, err := c.TakeSnapshot(nil, "v1")
 	if err != nil {
 		t.Fatal(err)
@@ -671,7 +671,7 @@ func TestRestoreDeletesFileInReadOnlyDir(t *testing.T) {
 	writeFile(t, dir, "ro-dir/delete-me.txt", "gone")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap1, err := c.TakeSnapshot(nil, "with-both")
 	if err != nil {
 		t.Fatal(err)
@@ -726,7 +726,7 @@ func TestRestoreRejectsNULInPath(t *testing.T) {
 	writeFile(t, dir, "a.txt", "legit")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap, _ := c.TakeSnapshot(nil, "first")
 
 	// Manually insert a snapshot with a NUL byte in the path
@@ -749,7 +749,7 @@ func TestRestoreRejectsNULInPath(t *testing.T) {
 func TestReadFileRejectsDirectory(t *testing.T) {
 	s, dir := setup(t)
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 
 	subDir := filepath.Join(dir, "subdir")
 	os.MkdirAll(subDir, 0755)
@@ -771,7 +771,7 @@ func TestRestorePreservesReadOnlyDirPerms(t *testing.T) {
 	writeFile(t, dir, "ro-dir/delete-me.txt", "gone")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap1, _ := c.TakeSnapshot(nil, "with-both")
 
 	// Remove delete-me.txt and snapshot
@@ -819,7 +819,7 @@ func TestPreviewCategorizesChanges(t *testing.T) {
 	writeFile(t, dir, "c.txt", "original-c")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap1, err := c.TakeSnapshot(nil, "first")
 	if err != nil {
 		t.Fatal(err)
@@ -866,7 +866,7 @@ func TestPreviewDetectsChmod(t *testing.T) {
 	os.Chmod(filepath.Join(dir, "script.sh"), 0755)
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap1, err := c.TakeSnapshot(nil, "executable")
 	if err != nil {
 		t.Fatal(err)
@@ -901,7 +901,7 @@ func TestPreviewNoChanges(t *testing.T) {
 	writeFile(t, dir, "a.txt", "hello")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap1, err := c.TakeSnapshot(nil, "first")
 	if err != nil {
 		t.Fatal(err)
@@ -955,7 +955,7 @@ func TestRestoreSkipsIgnoredPaths(t *testing.T) {
 	writeFile(t, dir, "a.txt", "tracked")
 
 	ig, _ := ignore.New(nil)
-	c := NewCreator(s, dir, ig)
+	c := NewCreator(s, dir, ig, nil)
 	snap, err := c.TakeSnapshot(nil, "first")
 	if err != nil {
 		t.Fatal(err)
