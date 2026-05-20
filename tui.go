@@ -110,6 +110,8 @@ type tuiModel struct {
 	height       int
 	topHeight    int
 	diffViewport viewport.Model
+
+	restoreRequest string // hash to restore after TUI exits (empty = none)
 }
 
 // Messages
@@ -190,8 +192,14 @@ func cmdTUI(args []string) error {
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
-	_, err = p.Run()
-	return err
+	final, err := p.Run()
+	if err != nil {
+		return err
+	}
+	if fm, ok := final.(tuiModel); ok && fm.restoreRequest != "" {
+		return cmdRestore([]string{fm.restoreRequest})
+	}
+	return nil
 }
 
 func (m tuiModel) Init() tea.Cmd {
@@ -286,6 +294,12 @@ func (m tuiModel) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch key {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "r", "R":
+			if snap := m.selectedSnapshot(); snap != nil {
+				m.restoreRequest = snap.Hash
+				return m, tea.Quit
+			}
+			return m, nil
 		case "tab":
 			m.focus = topPane
 			return m, nil
@@ -324,6 +338,12 @@ func (m tuiModel) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key {
 	case "q", "ctrl+c":
 		return m, tea.Quit
+	case "r", "R":
+		if snap := m.selectedSnapshot(); snap != nil {
+			m.restoreRequest = snap.Hash
+			return m, tea.Quit
+		}
+		return m, nil
 	case "esc":
 		if m.filterQuery != "" {
 			m.filtered = nil
@@ -670,9 +690,9 @@ func (m tuiModel) renderStatusBar() string {
 
 	var parts []string
 	if m.focus == topPane {
-		parts = append(parts, "j/k:navigate", "enter/tab:focus diff", "t:toggle mode", "/:search", "?:content", "q:quit")
+		parts = append(parts, "j/k:navigate", "enter/tab:focus diff", "t:toggle mode", "/:search", "?:content", "r:restore", "q:quit")
 	} else {
-		parts = append(parts, "j/k:scroll", "tab:focus list", "t:toggle mode", "/:search", "?:content", "q:quit")
+		parts = append(parts, "j/k:scroll", "tab:focus list", "t:toggle mode", "/:search", "?:content", "r:restore", "q:quit")
 	}
 
 	text := "  " + strings.Join(parts, "  ")

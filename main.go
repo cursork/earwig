@@ -16,11 +16,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/pmezard/go-difflib/difflib"
+	"golang.org/x/sys/unix"
 
+	"github.com/nk/earwig/internal/config"
 	"github.com/nk/earwig/internal/ignore"
 	"github.com/nk/earwig/internal/snapshot"
 	"github.com/nk/earwig/internal/store"
@@ -157,6 +160,10 @@ func loadIgnore(root string) (*ignore.Matcher, error) {
 	return ignore.New(files)
 }
 
+func loadConfig(root string) (*config.Config, error) {
+	return config.Load(filepath.Join(root, ".earwig", "config.json"))
+}
+
 func cmdInit(args []string) error {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -201,12 +208,17 @@ func cmdSnapshot(args []string) error {
 		return err
 	}
 
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+
 	parentID, err := readHead(root, s)
 	if err != nil {
 		return err
 	}
 
-	c := snapshot.NewCreator(s, root, ig)
+	c := snapshot.NewCreator(s, root, ig, cfg)
 	snap, err := c.TakeSnapshot(parentID, "manual")
 	if err != nil {
 		return err
@@ -767,31 +779,72 @@ func cmdWatch(args []string) error {
 		return err
 	}
 
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+
+	// Interactive cbreak-mode keystrokes when stdin is a TTY. cbreak (not full
+	// raw) disables line buffering + echo but keeps OPOST and ISIG on, so
+	// snapshot/warning output still renders normally and Ctrl+C still signals.
+	var (
+		oldTermios *unix.Termios
+		outMu      sync.Mutex // serializes prints + terminal-mode transitions
+	)
+	stdinFd := int(os.Stdin.Fd())
+	if isTerminal(stdinFd) {
+		if old, err := makeCBreak(stdinFd); err == nil {
+			oldTermios = old
+			defer restoreTermios(stdinFd, oldTermios)
+		}
+	}
+	interactive := oldTermios != nil
+
 	var (
 		mu           sync.Mutex
 		changedPaths = make(map[string]bool)
-		snapCount    int
+		snapCount    atomic.Int64
+		// snapMu serialises in-process takeSnap calls between the debouncer
+		// goroutine and the input goroutine. Distinct from the flock, which
+		// is cross-process (vs. `earwig restore` in another shell). Holding
+		// snapMu also makes safe our use of the shared snapshot.Creator —
+		// only one goroutine is inside Creator.Take(Incremental)Snapshot at
+		// a time, so its non-Creator-owned state (the *store.Store) doesn't
+		// need its own locking discipline here.
+		snapMu sync.Mutex
 	)
 
-	takeSnap := func() {
+	// One Creator for the whole watcher lifetime so per-path warning dedup
+	// (Creator.warnedSizes) actually persists across snapshots.
+	creator := snapshot.NewCreator(s, root, ig, cfg)
+
+	takeSnap := func() *store.Snapshot {
+		// In-process: only one snapshot at a time. Cross-process: flock
+		// keeps us out of restore's way. Mutex first; if it's contended
+		// (other goroutine running a snapshot now), we wait for that to
+		// finish — by which point changedPaths will have been swapped out
+		// and our walk will find genuinely-no-changes if there are none.
+		// That's better than the previous bail-out behaviour, which made
+		// 's' under contention print "(no changes)" misleadingly.
+		snapMu.Lock()
+		defer snapMu.Unlock()
+
 		// Acquire flock non-blocking — if restore holds it, skip this cycle.
 		flockFile, err := acquireFlock(root, false)
 		if err != nil {
 			log.Printf("error acquiring flock: %v", err)
-			return
+			return nil
 		}
 		if flockFile == nil {
-			return // restore in progress
+			return nil // restore in progress
 		}
 		defer flockFile.Close()
 
 		parentID, err := readHead(root, s)
 		if err != nil {
 			log.Printf("error reading HEAD: %v", err)
-			return
+			return nil
 		}
-
-		c := snapshot.NewCreator(s, root, ig)
 
 		var snap *store.Snapshot
 
@@ -802,29 +855,40 @@ func cmdWatch(args []string) error {
 		mu.Unlock()
 
 		// Every 10th snapshot or if no parent, do a full walk for consistency
-		snapCount++
-		if parentID == nil || snapCount%10 == 0 || len(paths) == 0 {
-			snap, err = c.TakeSnapshot(parentID, "auto")
+		n := snapCount.Add(1)
+		if parentID == nil || n%10 == 0 || len(paths) == 0 {
+			snap, err = creator.TakeSnapshot(parentID, "auto")
 		} else {
-			snap, err = c.TakeIncrementalSnapshot(*parentID, paths, "auto")
+			snap, err = creator.TakeIncrementalSnapshot(*parentID, paths, "auto")
 		}
 		if err != nil {
 			log.Printf("error taking snapshot: %v", err)
-			return
+			return nil
 		}
 		if snap == nil {
-			return // No changes
+			return nil // No changes
 		}
 
 		if err := writeHead(root, snap.ID); err != nil {
 			log.Printf("error writing HEAD: %v", err)
+			return nil
+		}
+		return snap
+	}
+
+	printSnap := func(snap *store.Snapshot) {
+		if snap == nil {
 			return
 		}
 		fmt.Printf("[%s] Snapshot %s\n", snap.CreatedAt.Format("15:04:05"), shortHash(snap.Hash))
 	}
 
 	// Initial snapshot (always full walk)
-	takeSnap()
+	if snap := takeSnap(); snap != nil {
+		outMu.Lock()
+		printSnap(snap)
+		outMu.Unlock()
+	}
 
 	debouncer := watcher.NewDebouncer(1 * time.Minute)
 	defer debouncer.Stop()
@@ -839,7 +903,14 @@ func cmdWatch(args []string) error {
 		mu.Lock()
 		changedPaths[relPath] = true
 		mu.Unlock()
-		debouncer.Trigger(takeSnap)
+		debouncer.Trigger(func() {
+			snap := takeSnap()
+			if snap != nil {
+				outMu.Lock()
+				printSnap(snap)
+				outMu.Unlock()
+			}
+		})
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -848,8 +919,284 @@ func cmdWatch(args []string) error {
 	// Clean up PID file on shutdown (best-effort, may not exist)
 	defer os.Remove(filepath.Join(root, ".earwig", "PID"))
 
-	fmt.Printf("Watching %s for changes (Ctrl+C to stop)\n", root)
-	return w.Run(ctx)
+	hint := "  (Ctrl+C to stop)"
+	if interactive {
+		hint = "  [c]heckpoint [s]napshot [l]og [t]ui [/]grep [?]help [q]uit"
+	}
+	fmt.Printf("Watching %s%s\n", root, hint)
+
+	inputDone := make(chan struct{})
+	if interactive {
+		go func() {
+			defer close(inputDone)
+			runWatchInput(ctx, stdinFd, oldTermios, &outMu, s, root, takeSnap, printSnap, cancel)
+		}()
+	} else {
+		close(inputDone)
+	}
+
+	runErr := w.Run(ctx)
+
+	// Wait for the input dispatcher to exit before our deferred closes
+	// (s.Close, restoreTermios, debouncer.Stop) run. The dispatcher holds
+	// references to s and creator — without this wait, a key processed
+	// between ctx-cancel and process exit could touch a closed store.
+	<-inputDone
+	return runErr
+}
+
+// readLineFromStdin reads bytes from os.Stdin one at a time until newline or
+// EOF and returns the trimmed line. Used during the '/' prompt instead of
+// bufio.NewReader, which would buffer extra bytes past the newline and lose
+// them when its scope ends — those bytes belong to runWatchInput's next read.
+func readLineFromStdin() string {
+	var b []byte
+	one := make([]byte, 1)
+	for {
+		n, err := os.Stdin.Read(one)
+		if err != nil || n == 0 {
+			break
+		}
+		if one[0] == '\n' || one[0] == '\r' {
+			break
+		}
+		b = append(b, one[0])
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// stdinByteChan returns a channel that yields one byte per stdin read, and
+// exits cleanly when ctx is cancelled. The TTY's os.Stdin.Read is otherwise
+// uncancellable; the self-pipe trick (poll on stdin + a pipe whose write-end
+// closes on ctx-done) is the portable way to unblock it without closing
+// stdin itself. No timer-based polling, no goroutine leak.
+//
+// On the rare error path where the pipe can't be created we fall back to a
+// plain blocking read — the goroutine then leaks at process exit, same as
+// before this commit. Logged so it's visible.
+func stdinByteChan(ctx context.Context) <-chan byte {
+	ch := make(chan byte)
+
+	pr, pw, perr := os.Pipe()
+	if perr != nil {
+		log.Printf("stdinByteChan: pipe creation failed (%v); falling back to leaking blocking read", perr)
+		go func() {
+			buf := make([]byte, 1)
+			for {
+				n, err := os.Stdin.Read(buf)
+				if err != nil || n == 0 {
+					return
+				}
+				select {
+				case ch <- buf[0]:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		return ch
+	}
+
+	// Closer goroutine: when ctx is done, close pw so the poll on pr wakes up.
+	go func() {
+		<-ctx.Done()
+		pw.Close()
+	}()
+
+	// Reader goroutine: poll on stdin + pipe, read stdin on POLLIN, exit on
+	// ctx-pipe event or any error.
+	go func() {
+		defer close(ch)
+		defer pr.Close()
+		defer pw.Close()
+
+		stdinFd := int32(os.Stdin.Fd())
+		pipeFd := int32(pr.Fd())
+		buf := make([]byte, 1)
+
+		for {
+			fds := []unix.PollFd{
+				{Fd: stdinFd, Events: unix.POLLIN},
+				{Fd: pipeFd, Events: unix.POLLIN},
+			}
+			_, err := unix.Poll(fds, -1)
+			if err != nil {
+				if err == unix.EINTR {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						continue
+					}
+				}
+				return
+			}
+			// ctx-done pipe became readable (closed-write-end) → exit.
+			if fds[1].Revents != 0 {
+				return
+			}
+			if fds[0].Revents&unix.POLLIN == 0 {
+				// POLLHUP / POLLERR on stdin without POLLIN — nothing more to read.
+				if fds[0].Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
+					return
+				}
+				continue
+			}
+			n, err := os.Stdin.Read(buf)
+			if err != nil || n == 0 {
+				return
+			}
+			select {
+			case ch <- buf[0]:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
+}
+
+// runWatchInput dispatches single-byte keystrokes to commands. For 'l', 't',
+// and '/', it temporarily restores cooked mode so cmdLog / cmdTUI / cmdGrep
+// render normally and line-editing works.
+//
+// outMu is held for the full duration of l/t/'/' subcommands by design: the
+// terminal-mode transition (cbreak → cooked → cbreak) and the subcommand's
+// output must not interleave with debouncer-driven snapshot prints, or the
+// stream gets garbled and the cooked-mode subcommand sees half-set termios.
+//
+// The dispatcher exits cleanly on ctx-done (signal or 'q'), so cmdWatch can
+// wait for it before running deferred closes that would invalidate the
+// closure-captured *store.Store and Creator.
+func runWatchInput(
+	ctx context.Context,
+	fd int,
+	oldTermios *unix.Termios,
+	outMu *sync.Mutex,
+	s *store.Store,
+	root string,
+	takeSnap func() *store.Snapshot,
+	printSnap func(*store.Snapshot),
+	cancel context.CancelFunc,
+) {
+	keys := stdinByteChan(ctx)
+	for {
+		var b byte
+		select {
+		case <-ctx.Done():
+			return
+		case k, ok := <-keys:
+			if !ok {
+				return
+			}
+			b = k
+		}
+		switch b {
+		case 'q', 'Q':
+			cancel()
+			return
+		case 'c', 'C':
+			outMu.Lock()
+			snap := takeSnap()
+			printSnap(snap)
+			// Pin the checkpoint target to snap.ID when we have one. Re-reading
+			// HEAD here would race with the debouncer: it can take its own
+			// snapshot and rewrite HEAD between our take and our read, leaving
+			// us checkpointing a different snapshot than the one we printed.
+			// Fall back to HEAD only when takeSnap returned nil (no changes).
+			var (
+				snapID   int64
+				snapHash string
+			)
+			if snap != nil {
+				snapID = snap.ID
+				snapHash = snap.Hash
+			} else {
+				headID, herr := readHead(root, s)
+				if herr != nil {
+					fmt.Printf("checkpoint: %v\n", herr)
+					outMu.Unlock()
+					continue
+				}
+				if headID == nil {
+					outMu.Unlock()
+					continue
+				}
+				snapID = *headID
+			}
+			var name string
+			var setErr error
+			for i := 0; i < 20; i++ {
+				var nameErr error
+				name, nameErr = randomCheckpointName()
+				if nameErr != nil {
+					fmt.Printf("checkpoint name: %v\n", nameErr)
+					break
+				}
+				setErr = s.SetCheckpoint(name, snapID)
+				if setErr == nil {
+					if snapHash == "" {
+						fmt.Printf("Checkpoint %s\n", name)
+					} else {
+						fmt.Printf("Checkpoint %s -> %s\n", name, shortHash(snapHash))
+					}
+					break
+				}
+				if !strings.Contains(setErr.Error(), "already exists") {
+					fmt.Printf("checkpoint: %v\n", setErr)
+					break
+				}
+			}
+			outMu.Unlock()
+		case 's', 'S':
+			outMu.Lock()
+			snap := takeSnap()
+			if snap == nil {
+				fmt.Println("(no changes)")
+			} else {
+				printSnap(snap)
+			}
+			outMu.Unlock()
+		case 'l', 'L':
+			outMu.Lock()
+			restoreTermios(fd, oldTermios)
+			if err := cmdLog(nil); err != nil {
+				fmt.Printf("log: %v\n", err)
+			}
+			if newOld, err := makeCBreak(fd); err == nil {
+				oldTermios = newOld
+			}
+			outMu.Unlock()
+		case 't', 'T':
+			outMu.Lock()
+			restoreTermios(fd, oldTermios)
+			if err := cmdTUI(nil); err != nil {
+				fmt.Printf("tui: %v\n", err)
+			}
+			if newOld, err := makeCBreak(fd); err == nil {
+				oldTermios = newOld
+			}
+			outMu.Unlock()
+		case '/':
+			outMu.Lock()
+			restoreTermios(fd, oldTermios)
+			fmt.Print("grep> ")
+			line := readLineFromStdin()
+			if line != "" {
+				if err := cmdGrep([]string{line}); err != nil {
+					fmt.Printf("grep: %v\n", err)
+				}
+			}
+			if newOld, err := makeCBreak(fd); err == nil {
+				oldTermios = newOld
+			}
+			outMu.Unlock()
+		case '?', 'h', 'H':
+			outMu.Lock()
+			fmt.Println("Keys: c=checkpoint  s=snapshot  l=log  t=tui  /=grep  ?=help  q=quit")
+			outMu.Unlock()
+		}
+	}
 }
 
 func detachWatcher() error {
@@ -926,6 +1273,11 @@ func cmdRestore(args []string) error {
 		return err
 	}
 
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+
 	// Acquire exclusive flock — blocks until watcher snapshot finishes.
 	flockFile, err := acquireFlock(root, true)
 	if err != nil {
@@ -961,7 +1313,7 @@ func cmdRestore(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := snapshot.NewCreator(s, root, ig)
+	c := snapshot.NewCreator(s, root, ig, cfg)
 	preSnap, err := c.TakeSnapshot(parentID, "pre-restore")
 	if err != nil {
 		return fmt.Errorf("pre-restore snapshot: %w", err)
@@ -1365,11 +1717,15 @@ func snapshotForCheck(s *store.Store, root string) (*store.Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return nil, err
+	}
 	parentID, err := readHead(root, s)
 	if err != nil {
 		return nil, err
 	}
-	c := snapshot.NewCreator(s, root, ig)
+	c := snapshot.NewCreator(s, root, ig, cfg)
 	snap, err := c.TakeSnapshot(parentID, "check")
 	if err != nil {
 		return nil, err

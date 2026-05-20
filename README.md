@@ -62,6 +62,20 @@ earwig watch -detach   # background daemon
 earwig processes       # see what's running
 ```
 
+When running in the foreground on a TTY, `earwig watch` accepts single-key commands without Enter:
+
+| Key | Action |
+|-----|--------|
+| `c` | Checkpoint (auto-snapshots first, random name) |
+| `s` | Manual snapshot now |
+| `l` | Print `earwig log` inline |
+| `t` | Launch the TUI (returns to watch on quit) |
+| `/` | Prompt for a grep pattern and run `earwig grep` |
+| `?` | Key help |
+| `q` / Ctrl+C | Quit |
+
+The watcher uses cbreak mode (line buffering and echo off, but signals and newline translation on), so background snapshot prints and warnings still render normally. When stdin is not a TTY (e.g. `-detach`, piped, redirected), the interactive layer is bypassed and the watcher behaves as before.
+
 ## Snapshots
 
 Each snapshot stores a **full file manifest** — not diffs. Content-addressable blob storage (SHA-256) means unchanged files cost nothing. Blobs >= 128KB are zstd-compressed when it helps.
@@ -116,6 +130,7 @@ Interactive split-pane browser. Top pane shows the snapshot list, bottom pane sh
 | `t` | Toggle diff mode (vs-filesystem / vs-parent) |
 | `/` | Search by filename |
 | `?` | Search file contents |
+| `r` | Restore the selected snapshot (exits TUI, runs the usual preview + confirm) |
 | `g` / `G` | Jump to top / bottom |
 | `q` | Quit |
 

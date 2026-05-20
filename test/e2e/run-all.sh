@@ -30,6 +30,19 @@ fi
 
 echo ""
 echo "========================================="
+echo " Watch interactive E2E tests"
+echo "========================================="
+if /test/watch_test.sh; then
+    echo ""
+    echo "Watch interactive tests passed."
+else
+    echo ""
+    echo "Watch interactive tests FAILED."
+    failed=1
+fi
+
+echo ""
+echo "========================================="
 echo " Generative E2E tests"
 echo "========================================="
 for i in 1 2 3; do

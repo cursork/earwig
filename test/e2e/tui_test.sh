@@ -11,8 +11,8 @@ source "$(dirname "$0")/dsl.sh"
 # ── tmux helpers ─────────────────────────────────────────
 
 SESSION="earwig-tui-test"
-TUI_WIDTH=80
-TUI_HEIGHT=24
+TUI_WIDTH=120
+TUI_HEIGHT=30
 
 tui_start() {
     local dir="$1"
@@ -326,6 +326,97 @@ expect_screen_contains "$SHASH1" "all snapshots after clear"
 expect_screen_contains "$SHASH2" "snapshot #2 visible after clear"
 expect_screen_contains "$SHASH3" "snapshot #3 visible after clear"
 expect_screen_not_contains "[content:" "content label removed"
+
+# =========================================================
+# TEST TUI-11: r key triggers restore
+# =========================================================
+blue "=== TUI TEST 11: r key restore ==="
+
+tui_stop
+
+init_project /tmp/earwig-tui-11
+write_file content.txt "version-1"
+snapshot
+write_file content.txt "version-2"
+snapshot
+write_file content.txt "version-3-uncommitted"
+
+RHASH1="${SNAPSHOTS[0]}"
+RHASH2="${SNAPSHOTS[1]}"
+
+# Start TUI with a lingering shell so we can interact with the restore prompt
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+tmux new-session -d -s "$SESSION" -x "$TUI_WIDTH" -y "$TUI_HEIGHT" \
+    "cd /tmp/earwig-tui-11 && earwig tui; echo TUI_EXITED; sleep 30"
+sleep 2
+
+# Verify status bar shows r:restore hint
+expect_screen_contains "r:restore" "restore key in status bar"
+
+# Navigate to oldest snapshot (version-1)
+tui_send G
+sleep 1
+expect_screen_contains "> $RHASH1" "cursor on oldest snapshot"
+
+# Press r to trigger restore — TUI exits the altscreen, cmdRestore prints the
+# preview on the main screen and prompts for confirmation.
+tui_send r
+sleep 2
+expect_screen_contains "Proceed?" "restore preview prompt visible"
+
+# Confirm restore. cmdTUI returns AFTER cmdRestore completes, which is when
+# the trailing `echo TUI_EXITED` fires.
+tmux send-keys -t "$SESSION" "y"
+tmux send-keys -t "$SESSION" Enter
+sleep 3
+
+expect_screen_contains "TUI_EXITED" "cmdTUI returned after restore completed"
+
+# Verify filesystem is restored to version-1
+expect_file content.txt "version-1"
+
+# Restore auto-snapshots the pre-restore state, so we should now have 3 snapshots
+# (user snapshot 1 + user snapshot 2 + pre-restore snapshot of version-3).
+expect_snapshot_count 3
+
+# =========================================================
+# TEST TUI-12: r from bottom pane also restores selected snapshot
+# =========================================================
+blue "=== TUI TEST 12: r restore from bottom pane ==="
+
+tui_stop
+
+init_project /tmp/earwig-tui-12
+write_file note.txt "first"
+snapshot
+write_file note.txt "second"
+snapshot
+write_file note.txt "third-uncommitted"
+
+THASH1="${SNAPSHOTS[0]}"
+
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+tmux new-session -d -s "$SESSION" -x "$TUI_WIDTH" -y "$TUI_HEIGHT" \
+    "cd /tmp/earwig-tui-12 && earwig tui; echo TUI_EXITED; sleep 30"
+sleep 2
+
+# Navigate to oldest, focus bottom pane, then press r
+tui_send G
+sleep 1
+tui_send Tab
+sleep 1
+expect_screen_contains "j/k:scroll" "bottom pane focused"
+
+tui_send r
+sleep 2
+expect_screen_contains "Proceed?" "restore prompt visible"
+
+tmux send-keys -t "$SESSION" "y"
+tmux send-keys -t "$SESSION" Enter
+sleep 3
+
+expect_screen_contains "TUI_EXITED" "cmdTUI returned after restore from bottom pane"
+expect_file note.txt "first"
 
 # =========================================================
 # Cleanup
