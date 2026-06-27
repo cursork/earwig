@@ -141,10 +141,40 @@ All data lives in `.earwig/` within the watched directory:
 - `earwig.db` — SQLite database (WAL mode)
 - `HEAD` — current snapshot ID
 - `flock` — file lock for mutual exclusion between watcher and restore
-- `ignore` — custom ignore patterns (gitignore syntax)
+- `ignore` — custom ignore patterns (gitignore syntax, plus `!` keeps)
 - `config.json` — optional JSON config (see below)
 
 earwig respects `.gitignore` and always ignores `.earwig/` and `.git/`.
+
+### Ignore files and keeps
+
+Patterns come from `.earwig/ignore` and `.gitignore` (gitignore syntax). A path
+matching any pattern is excluded from snapshots.
+
+A line beginning with `!` is a **keep**: it forces a path to be tracked even when
+another source would exclude it. Unlike gitignore's own `!` — which only
+re-includes within the single file that declares it — an earwig keep wins
+*across* sources, so it can override `.gitignore`:
+
+```
+# .gitignore  (e.g. maintained by another tool, or to keep generated output
+#              out of git)
+runs/
+
+# .earwig/ignore
+!runs/        # ...but DO snapshot runs/ in earwig
+```
+
+Mnemonically, `!` reads as "don't ignore". Keeps always beat excludes,
+regardless of source or declaration order. Two caveats:
+
+- The builtins (`.earwig/`, `.git/`) are absolute — a keep cannot re-include
+  them (otherwise earwig could snapshot its own database, or place git internals
+  under restore's management).
+- A keep cannot resurrect a path beneath a directory excluded by a *bare-name*
+  pattern (e.g. `secret`, no trailing slash), because the tree walk prunes that
+  directory before descending. Keep the directory itself, or write the exclude
+  with a trailing slash (`secret/`, which does not prune). This mirrors git.
 
 ### `config.json`
 

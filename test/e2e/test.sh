@@ -2297,6 +2297,63 @@ else
 fi
 
 # =========================================================
+# TEST 68: .earwig/ignore keep override (! protects gitignored paths)
+# =========================================================
+blue "=== TEST 68: .earwig/ignore keep override ==="
+
+init_project /tmp/earwig-test-68
+
+# .gitignore excludes keepdir/ and dropdir/; .earwig/ignore keeps keepdir/ via '!'.
+printf 'keepdir/\ndropdir/\n' > ".gitignore"
+printf '!keepdir/\n' > ".earwig/ignore"
+
+write_file "normal.txt" "N1"
+write_file "keepdir/a.txt" "A"
+write_file "keepdir/sub/b.txt" "B"
+write_file "dropdir/c.txt" "C"
+snapshot                                        # snapshot #1
+
+files_output=$(earwig _files "${SNAPSHOTS[0]}" 2>/dev/null)
+
+# Kept paths are snapshotted despite .gitignore excluding keepdir/.
+if echo "$files_output" | grep -q "keepdir/a.txt"; then
+    pass "keepdir/a.txt kept despite .gitignore (! override)"
+else
+    fail "keepdir/a.txt kept despite .gitignore" "not in snapshot"
+fi
+if echo "$files_output" | grep -q "keepdir/sub/b.txt"; then
+    pass "keepdir/sub/b.txt kept (nested under kept dir)"
+else
+    fail "keepdir/sub/b.txt kept (nested)" "not in snapshot"
+fi
+
+# A non-kept ignored path stays excluded.
+if echo "$files_output" | grep -q "dropdir/c.txt"; then
+    fail "dropdir/c.txt should stay ignored" "found in snapshot"
+else
+    pass "dropdir/c.txt excluded (no keep)"
+fi
+
+# Mutate the filesystem, then restore #1 and verify the DESTRUCTIVE path:
+#   - a kept file deleted on disk is recreated from the snapshot
+#   - a new file inside the kept dir (absent from #1) is DELETED — the kept
+#     directory is fully managed scope, exactly like any tracked directory
+#   - an IGNORED file is left untouched: restore must never delete ignored paths
+delete_file "keepdir/a.txt"
+write_file "keepdir/extra.txt" "EXTRA"          # kept scope, not in snapshot #1
+write_file "dropdir/d.txt" "D"                  # ignored, must survive restore
+write_file "normal.txt" "N2"
+
+restore 1
+
+expect_file "keepdir/a.txt" "A"                 # recreated from snapshot
+expect_file "keepdir/sub/b.txt" "B"             # unchanged
+expect_no_file "keepdir/extra.txt"              # deleted: kept scope is managed
+expect_file "dropdir/c.txt" "C"                 # ignored, untouched
+expect_file "dropdir/d.txt" "D"                 # ignored & not in #1 — must NOT be deleted
+expect_file "normal.txt" "N1"                   # reverted
+
+# =========================================================
 # DONE
 # =========================================================
 summary
