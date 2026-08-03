@@ -216,4 +216,78 @@ expect_watch_not_contains "Checkpoint " "c keypress did NOT create a checkpoint 
 # Cleanup: signal the watcher with SIGTERM via tmux kill
 watch_stop
 
+# =========================================================
+# TEST WATCH-11: one watcher per directory (startup gate)
+# =========================================================
+blue "=== WATCH TEST 11: single-watcher gate ==="
+
+TESTDIR3=/tmp/earwig-watch-11
+init_project "$TESTDIR3"          # cd's into TESTDIR3
+mkdir -p sub/deeper
+write_file g.txt "guard"
+
+# Start the first watcher headless (writes .earwig/PID).
+earwig watch -detach
+sleep 2
+first_pid=$(cat "$TESTDIR3/.earwig/PID")
+
+if earwig processes | grep -q "$TESTDIR3"; then
+    pass "processes lists the running watcher"
+else
+    fail "processes lists the running watcher" "$(earwig processes)"
+fi
+
+# A second detached watcher must be refused before spawning: non-zero exit,
+# a message that says 'already running', and it names the live PID.
+if out=$(earwig watch -detach 2>&1); then
+    fail "second -detach watcher refused" "expected non-zero exit, got success: $out"
+else
+    pass "second -detach watcher refused (non-zero exit)"
+fi
+if echo "$out" | grep -q "already running"; then
+    pass "refusal message says 'already running'"
+else
+    fail "refusal message says 'already running'" "$out"
+fi
+if echo "$out" | grep -q "$first_pid"; then
+    pass "refusal names the running watcher PID ($first_pid)"
+else
+    fail "refusal names the running watcher PID" "$out"
+fi
+
+# A foreground watcher must also refuse — and exit immediately, not block.
+# `timeout` bounds the hang case; asserting on the message distinguishes a
+# fast refusal (contains 'already running') from a hung watcher that got
+# killed by timeout (would show the 'Watching' banner instead).
+out=$(timeout 8 earwig watch 2>&1) || true
+if echo "$out" | grep -q "already running"; then
+    pass "foreground watcher refused immediately (no hang)"
+else
+    fail "foreground watcher refused immediately" "output: $out"
+fi
+
+# The gate resolves each watcher's root from its cwd, so it fires from a
+# subdirectory too (watcher launched at root, second attempt deeper down).
+cd "$TESTDIR3/sub/deeper"
+out=$(timeout 8 earwig watch 2>&1) || true
+if echo "$out" | grep -q "already running"; then
+    pass "watcher refused from a subdirectory (root resolved from cwd)"
+else
+    fail "watcher refused from a subdirectory" "output: $out"
+fi
+cd "$TESTDIR3"
+
+# Stop the first watcher by its EXACT PID (never pkill / pattern match).
+kill "$first_pid" 2>/dev/null || true
+sleep 3
+
+# With no watcher running, a fresh watcher starts fine again.
+if earwig watch -detach; then
+    pass "watcher starts again after the first stopped"
+    sleep 1
+    kill "$(cat "$TESTDIR3/.earwig/PID")" 2>/dev/null || true
+else
+    fail "watcher starts again after the first stopped" "unexpected refusal"
+fi
+
 summary

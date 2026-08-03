@@ -76,6 +76,8 @@ When running in the foreground on a TTY, `earwig watch` accepts single-key comma
 
 The watcher uses cbreak mode (line buffering and echo off, but signals and newline translation on), so background snapshot prints and warnings still render normally. When stdin is not a TTY (e.g. `-detach`, piped, redirected), the interactive layer is bypassed and the watcher behaves as before.
 
+**One watcher per directory.** Starting `earwig watch` (or `-detach`) when another watcher is already watching the same directory is refused — earwig prints the running watcher's PID and exits non-zero rather than running a redundant second watcher. Use `earwig processes` to see what's already running.
+
 ## Snapshots
 
 Each snapshot stores a **full file manifest** — not diffs. Content-addressable blob storage (SHA-256) means unchanged files cost nothing. Blobs >= 128KB are zstd-compressed when it helps.

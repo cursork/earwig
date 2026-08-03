@@ -99,29 +99,42 @@ Commands:
 `)
 }
 
-// findRoot walks up from cwd looking for .earwig/
-func findRoot() (string, error) {
-	dir, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	cwd := dir
+// findRootFrom walks up from startDir looking for a .earwig/ directory and
+// returns the directory that contains it plus how many levels up it was found.
+// Quiet (no warnings), so it can also resolve another process's watched root
+// during the single-watcher startup check.
+func findRootFrom(startDir string) (string, int, error) {
+	dir := startDir
 	levels := 0
 	for {
 		if _, err := os.Stat(filepath.Join(dir, ".earwig")); err == nil {
-			if levels > 2 {
-				rel, _ := filepath.Rel(dir, cwd)
-				fmt.Fprintf(os.Stderr, "warning: earwig root is %d levels above cwd (%s from %s)\n", levels, dir, rel)
-			}
-			return dir, nil
+			return dir, levels, nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", fmt.Errorf("not an earwig directory (or any parent): .earwig not found")
+			return "", 0, fmt.Errorf("not an earwig directory (or any parent): .earwig not found")
 		}
 		dir = parent
 		levels++
 	}
+}
+
+// findRoot walks up from cwd looking for .earwig/ and warns if the root is more
+// than two levels above cwd (scope-amplification risk).
+func findRoot() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	dir, levels, err := findRootFrom(cwd)
+	if err != nil {
+		return "", err
+	}
+	if levels > 2 {
+		rel, _ := filepath.Rel(dir, cwd)
+		fmt.Fprintf(os.Stderr, "warning: earwig root is %d levels above cwd (%s from %s)\n", levels, dir, rel)
+	}
+	return dir, nil
 }
 
 func openStore() (*store.Store, string, error) {
@@ -774,6 +787,13 @@ func cmdWatch(args []string) error {
 	}
 	defer s.Close()
 
+	// One watcher per directory. A second watcher is harmless but pointless, so
+	// refuse to start and point at the one already running. Best-effort (ps-based,
+	// so slightly racy on simultaneous starts) — acceptable for a not-ideal case.
+	if pid, running := watcherAlreadyRunning(root); running {
+		return fmt.Errorf("another earwig watcher is already running in %s (PID %d); only one watcher per directory is supported", root, pid)
+	}
+
 	ig, err := loadIgnore(root)
 	if err != nil {
 		return err
@@ -1203,6 +1223,12 @@ func detachWatcher() error {
 	root, err := findRoot()
 	if err != nil {
 		return err
+	}
+
+	// Refuse before spawning, so we don't print a bogus "started" line for a
+	// child that would immediately exit on the same one-watcher-per-dir check.
+	if pid, running := watcherAlreadyRunning(root); running {
+		return fmt.Errorf("another earwig watcher is already running in %s (PID %d); only one watcher per directory is supported", root, pid)
 	}
 
 	exe, err := os.Executable()
@@ -2133,22 +2159,43 @@ func cmdGC(args []string) error {
 	return nil
 }
 
-func cmdProcesses(args []string) error {
+// watcherProc is a live `earwig watch` process discovered via ps.
+type watcherProc struct {
+	PID   int
+	Etime string
+	Cwd   string // best-effort working directory; "" if unknown
+}
+
+// isEarwigWatchArgs reports whether a command line (argv fields) is an
+// `earwig watch` invocation: argv[0]'s basename is "earwig" and some later
+// argument is "watch". Tighter than a substring match, so an unrelated process
+// that merely mentions "earwig" and "watch" (e.g. an editor on a notes file) is
+// not mistaken for a watcher.
+func isEarwigWatchArgs(argv []string) bool {
+	if len(argv) == 0 || filepath.Base(argv[0]) != "earwig" {
+		return false
+	}
+	for _, a := range argv[1:] {
+		if a == "watch" {
+			return true
+		}
+	}
+	return false
+}
+
+// scanWatchers returns running `earwig watch` processes other than this one,
+// via ps. Cwd is filled in best-effort (may be "").
+func scanWatchers() ([]watcherProc, error) {
 	out, err := exec.Command("ps", "-eo", "pid,etime,args").Output()
 	if err != nil {
-		return fmt.Errorf("running ps: %w", err)
+		return nil, fmt.Errorf("running ps: %w", err)
 	}
 
 	myPID := os.Getpid()
-	found := false
-
+	var procs []watcherProc
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.Contains(line, "earwig") || !strings.Contains(line, "watch") {
-			continue
-		}
-		fields := strings.Fields(line)
+		fields := strings.Fields(strings.TrimSpace(scanner.Text()))
 		if len(fields) < 3 {
 			continue
 		}
@@ -2156,25 +2203,69 @@ func cmdProcesses(args []string) error {
 		if _, err := fmt.Sscanf(fields[0], "%d", &pid); err != nil {
 			continue
 		}
-		if pid == myPID {
+		if pid == myPID || !isEarwigWatchArgs(fields[2:]) {
 			continue
 		}
-
-		dir := processCwd(pid)
-		if !found {
-			found = true
-		}
-		if dir != "" {
-			fmt.Printf("PID %-8d  %-14s  %s\n", pid, fields[1], dir)
-		} else {
-			fmt.Printf("PID %-8d  %-14s  (unknown directory)\n", pid, fields[1])
-		}
+		procs = append(procs, watcherProc{PID: pid, Etime: fields[1], Cwd: processCwd(pid)})
 	}
+	return procs, nil
+}
 
-	if !found {
+func cmdProcesses(args []string) error {
+	procs, err := scanWatchers()
+	if err != nil {
+		return err
+	}
+	if len(procs) == 0 {
 		fmt.Println("No earwig watchers running.")
+		return nil
+	}
+	for _, p := range procs {
+		dir := p.Cwd
+		if dir == "" {
+			dir = "(unknown directory)"
+		}
+		fmt.Printf("PID %-8d  %-14s  %s\n", p.PID, p.Etime, dir)
 	}
 	return nil
+}
+
+// watcherAlreadyRunning reports whether another live `earwig watch` process is
+// already watching root. Each candidate's watched root is resolved from its cwd
+// (which may be a subdirectory of root), so the check holds regardless of where
+// each watcher was launched. The launcher of a `-detach` watcher (our parent) is
+// excluded. Best-effort: a ps failure returns false rather than blocking start.
+func watcherAlreadyRunning(root string) (int, bool) {
+	procs, err := scanWatchers()
+	if err != nil {
+		return 0, false
+	}
+	root = resolveDir(root)
+	ppid := os.Getppid()
+	for _, p := range procs {
+		if p.PID == ppid || p.Cwd == "" {
+			continue
+		}
+		r, _, err := findRootFrom(p.Cwd)
+		if err != nil {
+			continue
+		}
+		if resolveDir(r) == root {
+			return p.PID, true
+		}
+	}
+	return 0, false
+}
+
+// resolveDir canonicalizes a directory path (symlinks resolved) for comparing
+// watched roots. os.Getwd may yield /var/... while ps/lsof report the resolved
+// /private/var/... on macOS, so both sides must be canonicalized or the compare
+// misses. Falls back to Clean if the path can't be resolved.
+func resolveDir(p string) string {
+	if rp, err := filepath.EvalSymlinks(p); err == nil {
+		return rp
+	}
+	return filepath.Clean(p)
 }
 
 func processCwd(pid int) string {
