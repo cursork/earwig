@@ -14,15 +14,24 @@ func hasChanges(nDelete, nWrite, nModify, nChmod int) (result bool) {
 	return nDelete > 0 || nWrite > 0 || nModify > 0 || nChmod > 0
 }
 
-// isUnsafeSymlinkTarget returns true if a symlink target is potentially unsafe:
-// either an absolute path or containing ".." which could escape the root.
-// Extracting this from restore.go allows formal verification of exactly what
-// "unsafe" means.
+// isUnsafeSymlinkTarget reports whether a symlink target is unsafe to restore:
+// an absolute path, or one that escapes the repository root once resolved
+// relative to the link's own directory (linkDir, the link path's directory).
+// A target that merely contains ".." but stays within the root — e.g. a link at
+// pkg/models pointing to ../../web/static/style.css — is safe and is NOT flagged;
+// the previous "contains any .." check cried wolf on those ordinary relative
+// links. Extracting this from restore.go allows formal verification of exactly
+// what "unsafe" means: result is false only when the resolved target is relative
+// and does not climb out of the root.
 //
-// @ ensures result == (filepath.IsAbs(target) || strings.Contains(target, ".."))
+// @ ensures result == (filepath.IsAbs(target) || filepath.Clean(linkDir + "/" + target) == ".." || strings.HasPrefix(filepath.Clean(linkDir + "/" + target), ".." + string(filepath.Separator)))
 // @ decreases
-func isUnsafeSymlinkTarget(target string) (result bool) {
-	return filepath.IsAbs(target) || strings.Contains(target, "..")
+func isUnsafeSymlinkTarget(linkDir, target string) (result bool) {
+	if filepath.IsAbs(target) {
+		return true
+	}
+	resolved := filepath.Clean(linkDir + "/" + target)
+	return resolved == ".." || strings.HasPrefix(resolved, ".."+string(filepath.Separator))
 }
 
 // readFileType returns the file type string for a regular file.

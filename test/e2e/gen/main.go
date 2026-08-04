@@ -68,7 +68,7 @@ type Harness struct {
 	checkpoints map[string]int
 
 	// Operation counters
-	opCounts    map[string]int
+	opCounts     map[string]int
 	bytesWritten int64
 
 	// Snapshot hashes whose immutable manifest has already been verified once
@@ -595,6 +595,29 @@ func (h *Harness) verifySnapshotSet(after string) {
 			h.verified[sn.hash] = true
 		}
 	}
+
+	// Tree integrity: every parent_id is NULL or points to an EXISTING, OLDER
+	// snapshot (parent_id < id ⇒ acyclic + no forward/self ref; existence ⇒ no
+	// dangling parent). This checks the destructive DB re-parenting done by
+	// forget/trim, which Gobra doesn't reach (it verifies only which ids
+	// selectTrimTargets picks, not the re-parent that DeleteSnapshot performs).
+	if bad := strings.TrimSpace(h.earwig("db",
+		"SELECT count(*) FROM snapshots WHERE parent_id IS NOT NULL AND (parent_id >= id OR parent_id NOT IN (SELECT id FROM snapshots))")); bad == "0" {
+		h.pass++
+	} else {
+		h.fail++
+		fmt.Printf("  FAIL: %s snapshot(s) with dangling/forward parent_id after %s\n", bad, after)
+	}
+
+	// Blob integrity: every referenced blob still exists (catches an
+	// over-aggressive GC deleting a blob that a snapshot_files row still needs).
+	if bad := strings.TrimSpace(h.earwig("db",
+		"SELECT count(*) FROM snapshot_files WHERE blob_hash NOT IN (SELECT hash FROM blobs)")); bad == "0" {
+		h.pass++
+	} else {
+		h.fail++
+		fmt.Printf("  FAIL: %s snapshot_files row(s) referencing a missing blob after %s\n", bad, after)
+	}
 }
 
 func (h *Harness) opTrim() {
@@ -609,6 +632,29 @@ func (h *Harness) opTrim() {
 	}
 	n := len(dbHashes)
 	if n < 3 {
+		return
+	}
+
+	// ~5% of the time do a no-op: trim to a cutoff before the oldest snapshot
+	if h.rng.Intn(20) == 0 {
+		out := strings.TrimSpace(h.earwig("trim", "-y", "36500d"))
+		firstLine := out
+		if nl := strings.IndexByte(out, '\n'); nl >= 0 {
+			firstLine = out[:nl]
+		}
+		fmt.Printf("  trim -y 36500d (no-op, cutoff before oldest): %s\n", firstLine)
+		if strings.Contains(out, "Nothing to trim") {
+			h.pass++
+		} else {
+			h.fail++
+			fmt.Printf("  FAIL: expected no-op 'Nothing to trim', got: %s\n", firstLine)
+		}
+		if after := strings.TrimSpace(h.earwig("db", "SELECT count(*) FROM snapshots")); after == fmt.Sprint(n) {
+			h.pass++
+		} else {
+			h.fail++
+			fmt.Printf("  FAIL: no-op trim changed snapshot count %d -> %s\n", n, after)
+		}
 		return
 	}
 
@@ -1257,14 +1303,14 @@ func main() {
 	}
 	ops := []weightedOp{
 		{43, "write", h.opWriteFile},
-		{5, "chmod", h.opChmod},
+		{2, "chmod", h.opChmod},
 		{3, "symlink", h.opCreateSymlink},
 		{5, "delete_file", h.opDeleteFile},
 		{2, "delete_dir", h.opDeleteDir},
 		{23, "snapshot", h.opSnapshot},
-		{12, "restore", h.opRestore},
-		{3, "forget", h.opForget},
-		{2, "trim", h.opTrim},
+		{15, "restore", h.opRestore},
+		{4, "forget", h.opForget},
+		{4, "trim", h.opTrim},
 		{2, "gc", h.opGC},
 		{2, "checkpoint", h.opCheckpoint},
 		{1, "checkpoint_random", h.opCheckpointRandom},
@@ -1316,12 +1362,18 @@ func main() {
 		fmt.Printf("FAILED: %d failures, %d passed (seed=%d)\n", h.fail, h.pass, seed)
 	}
 
-	// Operation counts
+	// Operation counts — derived straight from the map so a newly-added op can
+	// never be missed (sorted for stable output across runs).
 	fmt.Printf("\nOperations:\n")
-	for _, name := range []string{"write", "chmod", "symlink", "delete_file", "delete_dir", "snapshot", "restore", "forget", "gc", "checkpoint", "checkpoint_delete", "checkpoint_restore"} {
-		fmt.Printf("  %-12s %d\n", name, h.opCounts[name])
+	opNames := make([]string, 0, len(h.opCounts))
+	for name := range h.opCounts {
+		opNames = append(opNames, name)
 	}
-	fmt.Printf("  %-12s %d\n", "snapshots_ok", len(h.snapshots))
+	sort.Strings(opNames)
+	for _, name := range opNames {
+		fmt.Printf("  %-18s %d\n", name, h.opCounts[name])
+	}
+	fmt.Printf("  %-18s %d\n", "snapshots_ok", len(h.snapshots))
 	fmt.Printf("  bytes_written: %.2f MB\n", float64(h.bytesWritten)/(1024*1024))
 
 	// Database stats

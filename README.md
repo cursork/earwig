@@ -223,7 +223,9 @@ and re-fire only when the file has grown past the previously-warned size.
 
 ## Safety
 
-earwig is designed with the assumption that the database could be tampered with. Key protections:
+earwig is designed with the assumption that the database could be tampered with,
+even just by a well-meaning user trying to get a 'fix' in - this includes earwig's
+author. Key protections:
 
 - **Path traversal prevention** — all paths validated to resolve within the root directory (formally verified)
 - **Blob integrity** — SHA-256 verified on every read
@@ -235,7 +237,7 @@ earwig is designed with the assumption that the database could be tampered with.
 - **Mutual exclusion** — `syscall.Flock` prevents watcher/restore races
 - **Crash recovery** — `RESTORING` marker enables detection and recovery
 
-Twelve security-critical functions are [formally verified using Gobra](GOBRA.md) (ETH Zurich, Z3 SMT solver).
+Easy to verify functions are [verified using Gobra](GOBRA.md) (ETH Zurich, Z3 SMT solver).
 
 ## Testing
 
@@ -258,4 +260,4 @@ go test ./internal/snapshot/ -fuzz FuzzSafePath -fuzztime 60s
 
 ## License
 
-Private.
+MIT

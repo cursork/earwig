@@ -926,24 +926,32 @@ func TestPreviewNoChanges(t *testing.T) {
 
 func TestIsUnsafeSymlinkTarget(t *testing.T) {
 	tests := []struct {
-		name   string
-		target string
-		want   bool
+		name    string
+		linkDir string
+		target  string
+		want    bool
 	}{
-		{"absolute path", "/etc/passwd", true},
-		{"dotdot component", "../escape", true},
-		{"dotdot in middle", "foo/../bar", true},
-		{"just dotdot", "..", true},
-		{"normal relative", "sibling.txt", false},
-		{"nested relative", "sub/dir/file.txt", false},
-		{"dot in name", "file..name.txt", true}, // Contains ".." even if not a path component
-		{"empty", "", false},
+		// Absolute targets are always unsafe.
+		{"absolute path", ".", "/etc/passwd", true},
+		// Targets that climb out of the root once resolved from the link's dir.
+		{"escaping dotdot from root", ".", "../escape", true},
+		{"bare dotdot from root", ".", "..", true},
+		{"escapes from subdir", "a/b", "../../../etc/passwd", true},
+		{"escapes to sibling of root", "a", "../../x", true},
+		// Targets that stay within the root are safe — no false positive.
+		{"dotdot resolving within root", ".", "foo/../bar", false},
+		{"dotdot chars in filename", ".", "file..name.txt", false},
+		{"up-and-over stays in root", "pkg/models", "../../web/static/style.css", false},
+		{"up one level stays in root", "a/b", "../c.txt", false},
+		{"normal relative", ".", "sibling.txt", false},
+		{"nested relative", ".", "sub/dir/file.txt", false},
+		{"empty target", ".", "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := isUnsafeSymlinkTarget(tt.target)
+			got := isUnsafeSymlinkTarget(tt.linkDir, tt.target)
 			if got != tt.want {
-				t.Fatalf("isUnsafeSymlinkTarget(%q) = %v, want %v", tt.target, got, tt.want)
+				t.Fatalf("isUnsafeSymlinkTarget(%q, %q) = %v, want %v", tt.linkDir, tt.target, got, tt.want)
 			}
 		})
 	}

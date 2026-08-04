@@ -160,7 +160,7 @@ func (r *Restorer) Restore(snapshotID int64) error {
 		switch f.Type {
 		case "symlink":
 			target := string(data)
-			if isUnsafeSymlinkTarget(target) {
+			if isUnsafeSymlinkTarget(filepath.Dir(f.Path), target) {
 				fmt.Fprintf(os.Stderr, "warning: symlink %s has potentially unsafe target: %s\n", f.Path, target)
 			}
 			if err := os.Symlink(target, absPath); err != nil {

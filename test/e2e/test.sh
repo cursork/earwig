@@ -1025,6 +1025,20 @@ else
     fail "dotdot symlink target triggers warning" "stderr: $warn_output2"
 fi
 
+# Create a symlink in a subdir whose ".." target stays WITHIN the root (should NOT warn)
+rm -f link-dotdot
+mkdir -p deep/nested
+ln -s ../../target.txt deep/nested/link-safe-updown
+snapshot                                        # snapshot #4
+
+rm -f deep/nested/link-safe-updown
+safe_output=$(earwig restore -y "${SNAPSHOTS[3]}" 2>&1)
+if echo "$safe_output" | grep -q "potentially unsafe target"; then
+    fail "within-root .. symlink should not warn" "got warning: $safe_output"
+else
+    pass "within-root .. symlink does not warn (no false positive)"
+fi
+
 # =========================================================
 # TEST 28: findRoot scope warning from deep subdirectory
 # =========================================================
