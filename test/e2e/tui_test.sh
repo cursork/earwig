@@ -38,14 +38,22 @@ tui_capture() {
 
 expect_screen_contains() {
     local pattern="$1" label="${2:-$1}"
-    local screen
-    screen=$(tui_capture)
-    if echo "$screen" | grep -qF "$pattern"; then
-        pass "screen contains '$label'"
-    else
-        fail "screen contains '$label'" "not found in:
+    local screen tries=0
+    # Poll: some panes (e.g. the diff) render asynchronously, so the content may
+    # not be present on the first capture. Retry up to ~5s before failing. This
+    # only waits when the pattern is genuinely absent — a present pattern passes
+    # immediately — so it hardens against render timing without weakening.
+    while [ "$tries" -lt 10 ]; do
+        screen=$(tui_capture)
+        if echo "$screen" | grep -qF "$pattern"; then
+            pass "screen contains '$label'"
+            return
+        fi
+        tries=$((tries + 1))
+        sleep 0.5
+    done
+    fail "screen contains '$label'" "not found in:
 $screen"
-    fi
 }
 
 expect_screen_not_contains() {

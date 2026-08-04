@@ -70,6 +70,10 @@ type Harness struct {
 	// Operation counters
 	opCounts    map[string]int
 	bytesWritten int64
+
+	// Snapshot hashes whose immutable manifest has already been verified once
+	// (verifySnapshotSet checks each snapshot's file list exactly once).
+	verified map[string]bool
 }
 
 func (h *Harness) fatalf(format string, args ...interface{}) {
@@ -92,6 +96,7 @@ func newHarness(seed int64) *Harness {
 		rng:         rand.New(rand.NewSource(seed)),
 		opCounts:    make(map[string]int),
 		checkpoints: make(map[string]int),
+		verified:    make(map[string]bool),
 	}
 
 	// earwig init
@@ -415,9 +420,10 @@ func (h *Harness) opRestore() {
 	idx := h.rng.Intn(len(h.snapshots))
 	snap := h.snapshots[idx]
 
-	h.earwig("restore", "-y", snap.hash)
-	h.model = snap.model.clone()
-	h.headHash = snap.hash
+	if !h.restoreTo(snap.hash, snap.hash, snap.model) {
+		fmt.Printf("  restore -> #%d (%s): already at target (no-op)\n", idx+1, snap.hash)
+		return
+	}
 	fmt.Printf("  restore -> #%d (%s)\n", idx+1, snap.hash)
 
 	h.verify(fmt.Sprintf("after restore to #%d", idx+1))
@@ -429,6 +435,33 @@ func (h *Harness) opRestore() {
 	if h.rng.Intn(10) == 0 {
 		h.verifyFiles(snap.hash, snap.model)
 	}
+}
+
+// restoreTo runs `earwig restore -y <ref>` to reach targetHash/targetModel. It
+// tracks the pre-restore snapshot earwig auto-creates (so the model stays == the
+// DB) and returns false for the no-op "Already at target state" case, where
+// earwig leaves the filesystem, HEAD, and (therefore) the model unchanged.
+func (h *Harness) restoreTo(ref, targetHash string, targetModel *Model) bool {
+	preModel := h.model.clone() // the tree earwig will capture as "pre-restore"
+	output := h.earwig("restore", "-y", ref)
+
+	if strings.Contains(output, "Already at target state") {
+		return false
+	}
+
+	// A pre-restore snapshot is a dangling tip parented on the old HEAD, holding
+	// the tree exactly as it was just now (preModel). Track it when created.
+	for _, line := range strings.Split(output, "\n") {
+		if s := strings.TrimSpace(line); strings.HasPrefix(s, "Saved current state as ") {
+			preHash := strings.TrimSpace(strings.TrimPrefix(s, "Saved current state as "))
+			h.snapshots = append(h.snapshots, SavedSnapshot{hash: preHash, model: preModel})
+			break
+		}
+	}
+
+	h.model = targetModel.clone()
+	h.headHash = targetHash
+	return true
 }
 
 func (h *Harness) opForget() {
@@ -470,6 +503,208 @@ func (h *Harness) opForget() {
 
 	// Verify a random surviving snapshot is still intact in the DB
 	// (catches blob over-deletion where forget/GC removes shared blobs)
+	if len(h.snapshots) > 0 {
+		check := h.snapshots[h.rng.Intn(len(h.snapshots))]
+		h.verifyFiles(check.hash, check.model)
+	}
+}
+
+// verifySnapshotSet asserts the model's tracked snapshots exactly equal the DB's,
+// and that headHash matches the real HEAD. Run after every snapshot-mutating op
+// so a divergence (an untracked snapshot, a phantom snapshot, or a stale HEAD)
+// fails at the op that introduced it — trivially reproducible from the seed —
+// rather than surfacing later at a trim.
+func (h *Harness) verifySnapshotSet(after string) {
+	dbSet := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(h.earwig("db", "SELECT substr(hash,1,12) FROM snapshots")), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			dbSet[line] = true
+		}
+	}
+	modelSet := map[string]bool{}
+	for _, sn := range h.snapshots {
+		modelSet[sn.hash] = true
+	}
+	var untracked, phantom []string
+	for hsh := range dbSet {
+		if !modelSet[hsh] {
+			untracked = append(untracked, hsh) // in DB, not in model
+		}
+	}
+	for hsh := range modelSet {
+		if !dbSet[hsh] {
+			phantom = append(phantom, hsh) // model recorded a hash the DB lacks
+		}
+	}
+	if len(untracked) == 0 && len(phantom) == 0 {
+		h.pass++
+	} else {
+		h.fail++
+		fmt.Printf("  FAIL: snapshot set diverged after %s\n    untracked (DB\\model): %v\n    phantom  (model\\DB): %v\n",
+			after, untracked, phantom)
+	}
+
+	// HEAD: the model's headHash must equal the real HEAD snapshot's hash.
+	if h.headHash != "" {
+		if data, err := os.ReadFile(filepath.Join(h.dir, ".earwig", "HEAD")); err == nil {
+			headID := strings.TrimSpace(string(data))
+			realHead := strings.TrimSpace(h.earwig("db",
+				fmt.Sprintf("SELECT substr(hash,1,12) FROM snapshots WHERE id=%s", headID)))
+			if realHead != "" && realHead != h.headHash {
+				h.fail++
+				fmt.Printf("  FAIL: headHash is %s but real HEAD is %s after %s\n", h.headHash, realHead, after)
+			} else {
+				h.pass++
+			}
+		}
+	}
+
+	// Checkpoints: the model's tracked names must equal the DB's.
+	dbChecks := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(h.earwig("db", "SELECT name FROM checkpoints")), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			dbChecks[line] = true
+		}
+	}
+	cpMatch := len(dbChecks) == len(h.checkpoints)
+	for name := range h.checkpoints {
+		if !dbChecks[name] {
+			cpMatch = false
+		}
+	}
+	if cpMatch {
+		h.pass++
+	} else {
+		h.fail++
+		var modelNames, dbNames []string
+		for name := range h.checkpoints {
+			modelNames = append(modelNames, name)
+		}
+		for name := range dbChecks {
+			dbNames = append(dbNames, name)
+		}
+		fmt.Printf("  FAIL: checkpoint set diverged after %s\n    model: %v\n    db:    %v\n", after, modelNames, dbNames)
+	}
+
+	// Manifest: verify each tracked snapshot's file list exactly once. Manifests
+	// are immutable once created, so re-checking is waste — this gives full
+	// manifest coverage at amortized ~O(1) per pass.
+	for _, sn := range h.snapshots {
+		if !h.verified[sn.hash] {
+			h.verifyFiles(sn.hash, sn.model)
+			h.verified[sn.hash] = true
+		}
+	}
+}
+
+func (h *Harness) opTrim() {
+	// Predict from DB ground truth, not the model: the DB carries snapshots the
+	// model doesn't track (e.g. the pre-restore snapshot earwig auto-creates on
+	// every restore), so a model-based prediction would be too small.
+	var dbHashes []string // all snapshots, creation order (id asc), 12-char
+	for _, line := range strings.Split(strings.TrimSpace(h.earwig("db", "SELECT substr(hash,1,12) FROM snapshots ORDER BY id")), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			dbHashes = append(dbHashes, line)
+		}
+	}
+	n := len(dbHashes)
+	if n < 3 {
+		return
+	}
+
+	// The harness creates many snapshots within the same wall-clock second, and
+	// created_at is second-resolution — so without help a trim-by-ref would
+	// almost always find nothing strictly older ("Nothing to trim"). Backdate
+	// every snapshot to a distinct, increasing time (by id order) so a trim
+	// deterministically deletes a known prefix and the delete + re-parent + gc +
+	// vacuum path is actually exercised.
+	base := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i, hsh := range dbHashes {
+		ts := base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)
+		h.earwig("db", fmt.Sprintf(
+			"UPDATE snapshots SET created_at='%s' WHERE substr(hash,1,12)='%s'", ts, hsh))
+	}
+
+	// Cutoff = created_at of snapshot #k (k in [2, n-1]); trim by that ref.
+	// Eligible = indices 0..k-1; boundary = k-1 (kept); so deleted = 0..k-2
+	// (minus HEAD), and survivors = {k-1, k..n-1} plus HEAD.
+	k := 2 + h.rng.Intn(n-2)
+	refHash := dbHashes[k]
+
+	headPos := -1
+	for i, hsh := range dbHashes {
+		if hsh == h.headHash {
+			headPos = i
+			break
+		}
+	}
+
+	expectSurvive := map[string]bool{}
+	for i := k - 1; i < n; i++ {
+		expectSurvive[dbHashes[i]] = true
+	}
+	if headPos >= 0 {
+		expectSurvive[dbHashes[headPos]] = true
+	}
+
+	out := strings.TrimSpace(h.earwig("trim", "-y", refHash))
+	firstLine := out
+	if nl := strings.IndexByte(out, '\n'); nl >= 0 {
+		firstLine = out[:nl]
+	}
+	fmt.Printf("  trim -y %s (cutoff=snapshot #%d of %d db): %s\n", refHash, k+1, n, firstLine)
+
+	// Survivors from the DB, as 12-char prefixes.
+	survivors := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(h.earwig("db", "SELECT substr(hash,1,12) FROM snapshots")), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			survivors[line] = true
+		}
+	}
+
+	// Exact match: the set of survivors must equal the predicted set.
+	match := len(survivors) == len(expectSurvive)
+	for hsh := range expectSurvive {
+		if !survivors[hsh] {
+			match = false
+		}
+	}
+	if match {
+		h.pass++
+	} else {
+		h.fail++
+		var got, want []string
+		for hsh := range survivors {
+			got = append(got, hsh)
+		}
+		for hsh := range expectSurvive {
+			want = append(want, hsh)
+		}
+		fmt.Printf("  FAIL: trim survivor set mismatch\n    want (%d): %v\n    got  (%d): %v\n",
+			len(want), want, len(got), got)
+	}
+
+	// Reconcile the model with what actually survived, remapping checkpoints.
+	oldToNew := map[int]int{}
+	var kept []SavedSnapshot
+	for i, snap := range h.snapshots {
+		if survivors[snap.hash] {
+			oldToNew[i] = len(kept)
+			kept = append(kept, snap)
+		}
+	}
+	newCheckpoints := map[string]int{}
+	for name, idx := range h.checkpoints {
+		if ni, ok := oldToNew[idx]; ok {
+			newCheckpoints[name] = ni // checkpoints on trimmed snapshots cascade-delete
+		}
+	}
+	h.snapshots = kept
+	h.checkpoints = newCheckpoints
+
+	// Trim never touches the working tree.
+	h.verify("after trim")
+	// A random surviving snapshot must still be fully intact in the DB.
 	if len(h.snapshots) > 0 {
 		check := h.snapshots[h.rng.Intn(len(h.snapshots))]
 		h.verifyFiles(check.hash, check.model)
@@ -616,9 +851,10 @@ func (h *Harness) opCheckpointRestore() {
 	idx := h.checkpoints[name]
 	snap := h.snapshots[idx]
 
-	h.earwig("restore", "-y", name)
-	h.model = snap.model.clone()
-	h.headHash = snap.hash
+	if !h.restoreTo(name, snap.hash, snap.model) {
+		fmt.Printf("  checkpoint restore %s -> #%d (%s): already at target (no-op)\n", name, idx+1, snap.hash)
+		return
+	}
 	fmt.Printf("  checkpoint restore %s -> #%d (%s)\n", name, idx+1, snap.hash)
 
 	h.verify(fmt.Sprintf("after checkpoint restore %s", name))
@@ -1028,6 +1264,7 @@ func main() {
 		{23, "snapshot", h.opSnapshot},
 		{12, "restore", h.opRestore},
 		{3, "forget", h.opForget},
+		{2, "trim", h.opTrim},
 		{2, "gc", h.opGC},
 		{2, "checkpoint", h.opCheckpoint},
 		{1, "checkpoint_random", h.opCheckpointRandom},
@@ -1040,6 +1277,16 @@ func main() {
 		totalWeight += op.weight
 	}
 
+	// Ops that can change the snapshot set, HEAD, checkpoints, or blobs. After
+	// each, verifySnapshotSet reconciles model vs DB so a divergence fails at the
+	// op that caused it. Pure-filesystem ops (write/chmod/symlink/delete) can't
+	// change any of those, so they're skipped.
+	mutatingOps := map[string]bool{
+		"snapshot": true, "restore": true, "forget": true, "gc": true,
+		"checkpoint": true, "checkpoint_random": true, "checkpoint_move": true,
+		"checkpoint_delete": true, "checkpoint_restore": true, "trim": true,
+	}
+
 	for i := 0; i < iterations; i++ {
 		r := h.rng.Intn(totalWeight)
 		cumulative := 0
@@ -1049,6 +1296,9 @@ func main() {
 				fmt.Printf("[%d/%d] %s\n", i+1, iterations, op.name)
 				h.opCounts[op.name]++
 				op.fn()
+				if mutatingOps[op.name] {
+					h.verifySnapshotSet(op.name)
+				}
 				break
 			}
 		}
@@ -1057,6 +1307,7 @@ func main() {
 	// Final snapshot + verify
 	fmt.Printf("\n[final] snapshot\n")
 	h.opSnapshot()
+	h.verifySnapshotSet("final")
 
 	fmt.Printf("\n================================\n")
 	if h.fail == 0 {

@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +46,7 @@ var commands = map[string]func([]string) error{
 	"grep":      cmdGrep,
 	"tui":       cmdTUI,
 	"processes": cmdProcesses,
+	"trim":      cmdTrim,
 	"db":        cmdDB,
 	"_files":    cmdFiles,
 }
@@ -92,6 +94,7 @@ Commands:
   check -u <name> [hash]  Move a checkpoint to a different snapshot
   checks                  List all checkpoints
   forget <hash>           Delete a snapshot (re-parents children, runs GC)
+  trim [-y] <age|ref>     Delete snapshots older than a duration (7d, 2w, 0s) or ref
   gc                      Remove orphaned blobs
   tui                     Interactive snapshot browser
   processes               List running earwig watchers
@@ -2155,6 +2158,154 @@ func cmdGC(args []string) error {
 		fmt.Println("No orphaned blobs.")
 	} else {
 		fmt.Printf("Removed %d orphaned blob(s).\n", count)
+	}
+	return nil
+}
+
+// parseTrimDuration parses a trim age spec into a duration. Accepts Go's
+// time.ParseDuration units (e.g. "12h", "90m", "0s", "1h30m") plus "d" (days)
+// and "w" (weeks), which time.ParseDuration lacks. Returns ok=false for
+// anything that isn't a non-negative duration (the caller then tries it as a
+// checkpoint/hash ref).
+func parseTrimDuration(spec string) (time.Duration, bool) {
+	if spec == "" {
+		return 0, false
+	}
+	switch spec[len(spec)-1] {
+	case 'd', 'w':
+		val, err := strconv.Atoi(spec[:len(spec)-1])
+		if err != nil || val < 0 {
+			return 0, false
+		}
+		unit := 24 * time.Hour
+		if spec[len(spec)-1] == 'w' {
+			unit = 7 * 24 * time.Hour
+		}
+		return time.Duration(val) * unit, true
+	default:
+		d, err := time.ParseDuration(spec)
+		if err != nil || d < 0 {
+			return 0, false
+		}
+		return d, true
+	}
+}
+
+// dbDiskSize returns the on-disk size of the database including its WAL/SHM
+// sidecars, so the trim report reflects real reclaimed space.
+func dbDiskSize(root string) int64 {
+	var total int64
+	for _, name := range []string{"earwig.db", "earwig.db-wal", "earwig.db-shm"} {
+		if fi, err := os.Stat(filepath.Join(root, ".earwig", name)); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGT"[exp])
+}
+
+func cmdTrim(args []string) error {
+	fs := flag.NewFlagSet("trim", flag.ContinueOnError)
+	yes := fs.Bool("y", false, "skip the confirmation prompt")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: earwig trim [-y] <age|ref>\n" +
+			"  age: 7d, 2w, 12h, 0s — delete snapshots older than that ago\n" +
+			"  ref: a checkpoint name or hash — delete snapshots older than it")
+	}
+	spec := fs.Arg(0)
+
+	s, root, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	// Resolve the cutoff time from either a duration or a ref.
+	var cutoff time.Time
+	if d, ok := parseTrimDuration(spec); ok {
+		cutoff = time.Now().Add(-d)
+	} else {
+		ref, rerr := s.ResolveRef(spec)
+		if rerr != nil {
+			return fmt.Errorf("%q is neither a duration (e.g. 7d, 2w, 0s) nor a known checkpoint/hash: %w", spec, rerr)
+		}
+		cutoff = ref.CreatedAt
+	}
+	cutoffUnix := cutoff.Unix()
+
+	headID := int64(-1)
+	if h, herr := readHead(root, s); herr == nil && h != nil {
+		headID = *h
+	}
+
+	// Blocking flock so the watcher can't snapshot mid-trim and the plan we
+	// preview is exactly what we delete.
+	flockFile, err := acquireFlock(root, true)
+	if err != nil {
+		return fmt.Errorf("acquiring lock: %w", err)
+	}
+	defer flockFile.Close()
+
+	targets, err := s.TrimTargets(cutoffUnix, headID)
+	if err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		fmt.Printf("Nothing to trim: no snapshots older than %s (the oldest survivor is always kept).\n",
+			cutoff.Format("2006-01-02 15:04:05"))
+		return nil
+	}
+
+	fmt.Printf("Trim to %s will delete %d snapshot(s):\n", cutoff.Format("2006-01-02 15:04:05"), len(targets))
+	const preview = 10
+	for i, tsnap := range targets {
+		if i == preview {
+			fmt.Printf("  ... and %d more\n", len(targets)-preview)
+			break
+		}
+		fmt.Printf("  %s  %s\n", shortHash(tsnap.Hash), tsnap.CreatedAt.Format("2006-01-02 15:04:05"))
+	}
+	fmt.Println("The oldest surviving snapshot becomes the new root; it and everything newer are kept.")
+
+	if !*yes {
+		if !confirm("Proceed? [y/N]") {
+			fmt.Println("Aborted.")
+			return nil
+		}
+	}
+
+	before := dbDiskSize(root)
+	n, err := s.Trim(cutoffUnix, headID)
+	if err != nil {
+		return err
+	}
+	freed, err := s.GarbageCollect()
+	if err != nil {
+		return err
+	}
+	if err := s.Vacuum(); err != nil {
+		return err
+	}
+	after := dbDiskSize(root)
+
+	fmt.Printf("Trimmed %d snapshot(s); removed %d orphaned blob(s).\n", n, freed)
+	if before > 0 && after > 0 && after <= before {
+		fmt.Printf("Database: %s -> %s (reclaimed %s).\n", humanBytes(before), humanBytes(after), humanBytes(before-after))
 	}
 	return nil
 }

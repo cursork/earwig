@@ -3,6 +3,8 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+# Unit tests run in the same container as E2E/gen (test-in-depth: every level in Docker).
+RUN go test ./...
 RUN go build -o /earwig .
 RUN go build -o /earwig-gen ./test/e2e/gen
 

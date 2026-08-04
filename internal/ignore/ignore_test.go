@@ -108,17 +108,17 @@ func TestMissingIgnoreFile(t *testing.T) {
 }
 
 func TestNonENOENTError(t *testing.T) {
-	// Create a file, then make it unreadable (non-ENOENT error)
+	// A directory at the ignore path makes os.ReadFile fail with a non-ENOENT
+	// error (EISDIR) for EVERY user, including root — unlike chmod 0000, which
+	// root bypasses (so this test also holds when run in the Docker container,
+	// where tests run as root). New must surface it, not silently skip.
 	dir := t.TempDir()
-	ignoreFile := filepath.Join(dir, "ignore")
-	if err := os.WriteFile(ignoreFile, []byte("*.log\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(ignoreFile, 0000); err != nil {
+	ignorePath := filepath.Join(dir, "ignore-is-a-directory")
+	if err := os.Mkdir(ignorePath, 0755); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err := New([]string{ignoreFile})
+	_, err := New([]string{ignorePath})
 	if err == nil {
 		t.Fatal("expected error for unreadable ignore file, got nil")
 	}

@@ -45,6 +45,7 @@ earwig tui                   # interactive browser
 | `check -u <name> [hash]` | Move a checkpoint to a different snapshot |
 | `checks` | List all checkpoints |
 | `forget <ref>` | Delete a snapshot (re-parents children, cascade-deletes checkpoints, runs GC) |
+| `trim [-y] <age\|ref>` | Delete snapshots older than a duration (`7d`, `2w`, `0s`) or a ref, then reclaim disk |
 | `gc` | Remove orphaned blobs |
 | `tui` | Interactive split-pane snapshot browser |
 | `processes` | List running earwig watchers |
@@ -107,6 +108,24 @@ earwig restore release-v2       # restore by name
 earwig check -d release-v2      # delete
 earwig check -u release-v2      # move to current state
 ```
+
+## Trimming history
+
+Auto-snapshots accumulate. `trim` deletes old ones to reclaim disk, keeping a
+safe floor so it can never wipe out everything.
+
+```bash
+earwig trim 7d              # delete snapshots older than 7 days ago
+earwig trim 2w              # ... older than 2 weeks
+earwig trim 0s              # collapse to just the latest snapshot
+earwig trim release-v2      # delete snapshots older than a checkpoint/hash
+earwig trim -y 7d           # skip the confirmation prompt
+```
+
+The cutoff is a duration ago (`s`, `m`, `h`, `d`, `w`) or a ref's timestamp.
+Trim keeps the **newest snapshot older than the cutoff** (the retained floor),
+everything newer, and the current `HEAD` — and deletes the rest. So `trim 0s`
+leaves exactly one snapshot, and a lone month-old snapshot survives `trim 7d`.
 
 ## Grep
 

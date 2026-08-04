@@ -2354,6 +2354,125 @@ expect_file "dropdir/d.txt" "D"                 # ignored & not in #1 — must N
 expect_file "normal.txt" "N1"                   # reverted
 
 # =========================================================
+# TEST 69: trim by age — keep boundary + newer, delete older
+# =========================================================
+blue "=== TEST 69: trim by age ==="
+
+init_project /tmp/earwig-trim-age
+for v in A B C D E F; do write_file f.txt "v$v"; snapshot; done   # ids 1..6, chain
+
+# Backdate A..E; F (id 6) stays ~now.
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days') WHERE id=1" >/dev/null
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-20 days') WHERE id=2" >/dev/null
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-10 days') WHERE id=3" >/dev/null
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-5 days')  WHERE id=4" >/dev/null
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-2 days')  WHERE id=5" >/dev/null
+
+trim_out=$(earwig trim -y 7d)
+if echo "$trim_out" | grep -q "Trimmed 2 snapshot"; then
+    pass "trim -y 7d reports deleting 2 snapshots"
+else
+    fail "trim -y 7d reports deleting 2" "$trim_out"
+fi
+
+remaining=$(earwig db "SELECT count(*) FROM snapshots")
+[ "$remaining" = "4" ] && pass "trim 7d left 4 snapshots (C,D,E,F)" || fail "trim 7d survivor count" "got $remaining want 4"
+
+gone=$(earwig db "SELECT count(*) FROM snapshots WHERE id IN (1,2)")
+[ "$gone" = "0" ] && pass "A,B (older than 7d) deleted" || fail "A,B deleted" "count $gone"
+
+kept=$(earwig db "SELECT count(*) FROM snapshots WHERE id IN (3,4,5,6)")
+[ "$kept" = "4" ] && pass "boundary C + newer D,E,F kept" || fail "C,D,E,F kept" "count $kept"
+
+cparent=$(earwig db "SELECT COALESCE(parent_id,'ROOT') FROM snapshots WHERE id=3")
+[ "$cparent" = "ROOT" ] && pass "boundary C re-parented to root" || fail "boundary C is root" "parent=$cparent"
+
+# Boundary content survives and restores.
+earwig restore -y "${SNAPSHOTS[2]}" >/dev/null
+expect_file f.txt "vC"
+
+# =========================================================
+# TEST 70: trim 0s collapses to the newest snapshot
+# =========================================================
+blue "=== TEST 70: trim 0s collapse ==="
+
+init_project /tmp/earwig-trim-collapse
+for v in a b c d; do write_file f.txt "$v"; snapshot; done   # ids 1..4
+# Backdate all into the past so `trim 0s` (cutoff = now) treats them all as older.
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-4 hours') WHERE id=1" >/dev/null
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-3 hours') WHERE id=2" >/dev/null
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-2 hours') WHERE id=3" >/dev/null
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hours') WHERE id=4" >/dev/null
+
+earwig trim -y 0s >/dev/null
+n=$(earwig db "SELECT count(*) FROM snapshots")
+[ "$n" = "1" ] && pass "trim 0s collapsed to 1 snapshot" || fail "trim 0s collapse" "got $n want 1"
+survivor=$(earwig db "SELECT id FROM snapshots")
+[ "$survivor" = "4" ] && pass "the surviving snapshot is the newest (id 4)" || fail "survivor is newest" "id=$survivor"
+
+# =========================================================
+# TEST 71: trim by checkpoint/hash ref
+# =========================================================
+blue "=== TEST 71: trim by ref ==="
+
+init_project /tmp/earwig-trim-ref
+for v in a b c d e; do write_file f.txt "$v"; snapshot; done   # ids 1..5
+earwig check mypoint "${SNAPSHOTS[2]}" >/dev/null              # checkpoint on id 3
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days') WHERE id=1" >/dev/null
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-20 days') WHERE id=2" >/dev/null
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-10 days') WHERE id=3" >/dev/null
+
+# cutoff = id3's created_at (-10d): only id1,id2 are older; boundary=id2; delete id1.
+earwig trim -y mypoint >/dev/null
+[ "$(earwig db 'SELECT count(*) FROM snapshots WHERE id=1')" = "0" ] && pass "trim by ref deleted the oldest" || fail "trim by ref deleted oldest" "id1 remains"
+[ "$(earwig db 'SELECT count(*) FROM snapshots WHERE id=3')" = "1" ] && pass "trim by ref keeps the ref snapshot" || fail "ref snapshot kept" "id3 gone"
+earwig checks | grep -q "mypoint" && pass "checkpoint on the ref survives trim" || fail "checkpoint survives" "$(earwig checks)"
+
+# =========================================================
+# TEST 72: trim no-op when nothing is older than the cutoff
+# =========================================================
+blue "=== TEST 72: trim no-op ==="
+
+init_project /tmp/earwig-trim-noop
+for v in a b c; do write_file f.txt "$v"; snapshot; done       # all ~now
+before=$(earwig db "SELECT count(*) FROM snapshots")
+noop_out=$(earwig trim -y 100d)
+after=$(earwig db "SELECT count(*) FROM snapshots")
+[ "$before" = "$after" ] && pass "trim 100d is a no-op (nothing older)" || fail "trim no-op count" "$before -> $after"
+echo "$noop_out" | grep -q "Nothing to trim" && pass "no-op prints 'Nothing to trim'" || fail "no-op message" "$noop_out"
+
+# =========================================================
+# TEST 73: preview + decline keeps all; -y skips prompt
+# =========================================================
+blue "=== TEST 73: trim confirm/decline ==="
+
+init_project /tmp/earwig-trim-confirm
+for v in a b c d; do write_file f.txt "$v"; snapshot; done      # ids 1..4
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days') WHERE id=1" >/dev/null
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-20 days') WHERE id=2" >/dev/null
+earwig db "UPDATE snapshots SET created_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','-10 days') WHERE id=3" >/dev/null
+
+decline_out=$(echo "n" | earwig trim 7d)
+echo "$decline_out" | grep -q "Aborted" && pass "declining the prompt aborts" || fail "decline aborts" "$decline_out"
+[ "$(earwig db 'SELECT count(*) FROM snapshots')" = "4" ] && pass "decline left all snapshots" || fail "decline kept all" "count changed"
+
+earwig trim -y 7d >/dev/null
+[ "$(earwig db 'SELECT count(*) FROM snapshots')" -lt "4" ] && pass "-y trimmed without a prompt" || fail "-y trimmed" "count unchanged"
+
+# =========================================================
+# TEST 74: trim rejects an invalid spec
+# =========================================================
+blue "=== TEST 74: trim invalid spec ==="
+
+init_project /tmp/earwig-trim-bad
+write_file f.txt "x"; snapshot
+if earwig trim -y not-a-duration-or-ref 2>/dev/null; then
+    fail "trim rejects invalid spec" "expected non-zero exit"
+else
+    pass "trim rejects an unknown duration/ref (non-zero exit)"
+fi
+
+# =========================================================
 # DONE
 # =========================================================
 summary
